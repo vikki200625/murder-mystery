@@ -1,0 +1,3404 @@
+extends Node3D
+# Builds the entire mansion, the player, the selected suspects, and all UI purely in
+# code (no hand-authored sub-scenes), so the whole game lives in a handful of
+# readable script files. Also acts as the central "controller" that NPCs and
+# the front door call into (via the "main_controller" group) to open dialogue
+# / accusation panels.
+
+# By path rather than by class_name, so a fresh clone can't hit the global
+# class scan-order race - see the header of SuspectModel.gd.
+const SuspectModel = preload("res://Scripts/SuspectModel.gd")
+
+const CELL := 12.0
+const PITCH := 13.0
+const WALL_H := 3.0
+const WALL_T := 0.4
+const DOOR_W := 3.0
+
+## How far a wall runs along its own axis, and how far out from a room's centre
+## it sits. This is the corner-gap fix, and it is the same one ManorBuilder
+## already applies to the upper floor.
+##
+## Walls used to be CELL long (12) sitting at CELL/2, while rooms are spaced
+## PITCH apart (13). Every wall therefore stopped 1.0 short of the next one and
+## left a hole exactly where the corner should be, sixteen of them on this
+## floor. Measured by flood fill, the widest clear route from outside into a
+## room was 0.76m against a 0.80m player capsule: you could see straight out
+## through every corner, and only miss walking out by 4cm.
+##
+## At PITCH the walls sit on the room boundary instead, so each one butts its
+## neighbour end to end with neither gap nor overlap - not PITCH + WALL_T, which
+## also seals the corners but puts two same-facing coplanar quads in the same
+## place at every junction and makes the walls shimmer.
+##
+## Two things fall out of it. Rooms become symmetric, instead of 0.5 short on
+## their south and east sides and 0.5 long on the other two. And the doorway
+## waypoint get_room_travel_waypoints() computes - the midpoint between two room
+## centres - lands exactly in the opening rather than half a metre past it.
+const WALL_SPAN := PITCH
+
+# The Hall doubles as the meetup room: suspects ordered there gather for a
+# group confrontation.
+#
+# The cap counts SUSPECTS, not people - the detective is never an attendee - so
+# 2 means a three-handed scene: you and two of them. That's deliberately the
+# whole format. A two-hander is the sharpest possible confrontation (one
+# accuses, one defends, you referee), a round costs only two sequential Ollama
+# calls instead of four, and each suspect's memory fills half as fast. It also
+# halves the number of other names in the room that a small model can mistake
+# for the detective, which is the failure that kept surfacing at four.
+#
+# Raise this back to 4 for bigger, messier confrontations - nothing else
+# depends on the value.
+const MEETUP_ROOM := "Hall"
+# Raised from 2 to 4 once a Hall meetup stopped costing O(N^2) in stored tokens.
+#
+# The old limit was not a drama choice, it was a latency ceiling: every line the
+# detective said cost one sequential Ollama request per attendee, and each of
+# those re-read that suspect's whole history because the room rotates between
+# characters and only one KV-cache slot existed. Four attendees measured ~10s of
+# dead air per line.
+#
+# What changed: group lines are no longer copied into every attendee's permanent
+# memory (GroupChat renders the scene on demand instead), the system prompt now
+# shares a cached prefix across all suspects, and OLLAMA_NUM_PARALLEL=4 gives
+# each suspect their own cache slot. See PLAN_DialogueOptimization.md.
+#
+# Note this is a cap on the ROOM, not on drama: three-handed scenes are still
+# the sharpest, because one accuser and one defender is the cleanest shape.
+const MAX_HALL_ATTENDEES := 4
+
+# Body text size for the conversation panels (one-on-one and the Hall). Godot's
+# default control font is 16, so this is that bumped by 50% for readability.
+# The panel dimensions and the log/input minimum sizes were grown to match -
+# retune those alongside this if you change it.
+const DIALOGUE_FONT_SIZE := 40
+
+# How tall the question boxes are allowed to grow. They open one row high and
+# grow a row at a time as the text wraps, then stop here and scroll instead.
+const INPUT_MAX_ROWS := 3
+
+# 3x3 layout. Hall (front door + player spawn) sits at the front-center so
+# the front door can face the exterior.
+const GRID := [
+	["Kitchen", "Ballroom", "Conservatory"],
+	["Lounge", "Dining Room", "Study"],
+	["Billiard Room", "Hall", "Library"],
+]
+
+const ROOM_COLORS := {
+	"Kitchen": Color(0.85, 0.8, 0.6),
+	"Ballroom": Color(0.75, 0.65, 0.85),
+	"Conservatory": Color(0.65, 0.85, 0.7),
+	"Lounge": Color(0.8, 0.6, 0.55),
+	"Study": Color(0.6, 0.55, 0.75),
+	"Dining Room": Color(0.85, 0.7, 0.5),
+	"Billiard Room": Color(0.4, 0.5, 0.45),
+	"Library": Color(0.55, 0.45, 0.35),
+	"Hall": Color(0.75, 0.72, 0.65),
+}
+const WALL_COLOR := Color(0.92, 0.9, 0.85)
+
+# These double as both the suspect's 3D capsule color AND their name color
+# in the Case Notes UI, so every entry needs to stay legible as text on a
+# dark panel background - avoid very dark/near-black shades here.
+const NPC_COLORS := {
+	"blackwood": Color(0.2, 0.5, 0.8),
+	"sterling": Color(0.8, 0.2, 0.2),
+	"ashford": Color(0.7, 0.2, 0.6),
+	"carter": Color(0.6, 0.6, 0.65),
+	"whitmore": Color(0.9, 0.7, 0.2),
+	"reeves": Color(0.4, 0.6, 0.3),
+	"cross_natalie": Color(0.8, 0.4, 0.1),
+	"cross_eugene": Color(0.6, 0.5, 0.4),
+	# The four added to take the roster to 12. Each was picked to sit well
+	# clear of the gold/orange/tan cluster above, which is already the closest
+	# trio in the set. Twelve is about the practical ceiling here: a thirteenth
+	# suspect means reworking the palette rather than appending to it.
+	"moreau": Color(0.95, 0.6, 0.7),
+	"varga": Color(0.65, 0.55, 0.95),
+	"pike": Color(0.15, 0.85, 0.65),
+	"thorne": Color(0.55, 0.95, 0.4),
+}
+
+var rooms_node: Node3D
+var room_centers: Dictionary = {}
+var grid_pos: Dictionary = {} # room name -> Vector2i(row, col), for pathing between rooms
+var player: CharacterBody3D
+var front_door_node = null
+
+var npc_nodes: Dictionary = {} # character_id -> spawned NPCCharacter node
+
+# Movement commands typed straight into the dialogue box, e.g. "go to the
+# library" or "wait in the study" - detected with plain regex (no extra
+# Ollama round-trip) rather than sent through GameManager as a question.
+var room_name_lookup: Dictionary = {} # lowercase room name -> canonical room name
+var move_command_regex: RegEx = null
+var wait_command_regex: RegEx = null
+
+# Floor-control orders typed into the Hall meetup box - "Marcus, be quiet",
+# "everyone except Eleanor stay quiet", "Tom, you can go". Detected locally
+# the same way movement commands are, so an order to the room never costs an
+# Ollama round-trip and never gets answered in character.
+var group_silence_regex: RegEx = null
+var group_speak_regex: RegEx = null
+var group_leave_regex: RegEx = null
+var group_everyone_regex: RegEx = null
+var group_except_regex: RegEx = null
+
+var ui_layer: CanvasLayer
+var crosshair: ColorRect
+var prompt_label: Label
+
+var dialogue_panel: Panel
+var dialogue_name_label: Label
+var dialogue_log: RichTextLabel
+var dialogue_input: TextEdit
+var dialogue_ask_button: Button
+var dialogue_status_label: Label
+var current_dialogue_character: String = ""
+
+# Hall meetup panel - the group confrontation. The turn logic itself lives in
+# GameManager.group_chat (Scripts/GroupChat.gd); everything here is UI.
+var group_panel: Panel
+var group_roster: HBoxContainer
+var group_log: RichTextLabel
+var group_input: TextEdit
+var group_say_button: Button
+var group_status_label: Label
+var group_frozen_ids: Array = [] # attendees currently held still by the open scene
+
+var accusation_panel: Panel
+var accusation_suspect_buttons: Dictionary = {} # character_id -> Button
+var accusation_selected_id: String = ""
+var accusation_accuse_button: Button
+var accusation_result_label: Label
+
+# The mansion map (M). Drawn as a 3x3 grid of cells mirroring GRID rather than
+# rendered from the 3D world, because GRID *is* the floor plan - a second
+# viewport would cost far more and tell you nothing extra.
+var map_panel: Panel
+var map_room_cells: Dictionary = {} # room name -> PanelContainer, for the "you are here" highlight
+var map_room_occupants: Dictionary = {} # room name -> RichTextLabel listing who's in it
+var map_refresh_timer: Timer
+
+var notes_panel: Panel
+var notes_log: RichTextLabel
+var notes_tab_buttons: Dictionary = {} # character_id -> Button
+var notes_flag_dots: Dictionary = {} # character_id -> ColorRect (shown when Slipups has real content)
+var notes_selected_char: String = ""
+
+## Reserved tab id for the crime-scene evidence pane. Not a character, so
+## anything that treats a tab id as a suspect has to skip it.
+const EVIDENCE_TAB := "__evidence__"
+var _pending_summaries: Dictionary = {} # character_id -> true while a summary request is in flight
+
+var win_panel: Panel
+var win_label: Label
+
+var debug_label: Label
+var examine_panel: Panel
+var examine_title_label: Label
+var examine_body: RichTextLabel
+var crime_scene: Node3D
+
+## Background furniture, built by ManorDressing from Models/Furniture. Held so
+## a restart can free the whole lot in one call, same as crime_scene.
+var furniture: Node3D
+
+## The second storey, built by an instance of ManorBuilder configured to emit
+## level 1 only. Player-only space: none of these room names appear in GRID,
+## grid_pos, room_centers or CaseGenerator.GRID, which is precisely what keeps
+## every suspect, every schedule and every alibi downstairs without the case
+## generator needing to know the floor exists.
+var upper_floor: Node3D
+
+## Upstairs room name -> world centre, with y at that floor's level. Read by
+## _room_at() and handed to ManorDressing so the upstairs can be furnished.
+var upper_room_centers: Dictionary = {}
+
+## Upstairs room name -> Vector2i(row, col) on the upper floor's own grid.
+## Deliberately separate from grid_pos: sharing one dictionary would collide,
+## since the Stair Hall and the Hall occupy the same cell.
+var upper_grid_pos: Dictionary = {}
+
+## Ground-floor rooms that have an upstairs room directly above them. Those
+## rooms get no ceiling of their own: the upper floor's slab occupies exactly
+## the band Main's ceiling would have, so building both would put two coplanar
+## slabs in the same place and cap the stairwell into the bargain.
+var _roofed_by_upper: Dictionary = {}
+
+var name_regexes: Dictionary = {} # character_id -> compiled RegEx matching that suspect's name variants
+
+var selection_layer: CanvasLayer
+var selection_checkboxes: Dictionary = {} # character_id -> CheckBox
+var selection_count_label: Label
+var selection_start_button: Button
+var selection_log_checkbox: CheckBox
+var selection_seed_input: LineEdit
+var selection_seed_status: Label
+
+
+func _ready() -> void:
+	add_to_group("main_controller")
+	GameManager.ollama_response.connect(_on_ollama_response)
+	GameManager.ollama_error.connect(_on_ollama_error)
+	GameManager.summary_ready.connect(_on_summary_ready)
+	GameManager.summary_error.connect(_on_summary_error)
+
+	GameManager.group_chat.line_added.connect(_on_group_line_added)
+	GameManager.group_chat.turn_started.connect(_on_group_turn_started)
+	GameManager.group_chat.state_changed.connect(_on_group_state_changed)
+	GameManager.group_chat.round_failed.connect(_on_group_round_failed)
+	GameManager.group_chat.roster_changed.connect(_on_group_roster_changed)
+	GameManager.group_chat.quorum_lost.connect(_on_group_quorum_lost)
+
+	_build_room_name_lookup()
+	_build_move_command_regexes()
+	_build_group_command_regexes()
+
+	# The mouse may still be captured (MOUSE_MODE_CAPTURED) from a previous
+	# game if this is a "Play Again" scene reload - make sure it's free so
+	# the player can click checkboxes on the selection screen below.
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	_build_selection_screen()
+
+
+## Builds the whole game (mansion, suspects, player, UI) once the player has
+## picked which suspects are in tonight - called from _on_start_pressed().
+func _start_game(selected_ids: Array) -> void:
+	GameManager.start_new_game(selected_ids)
+	# Re-read suspect_models.cfg from disk, so editing a colour and hitting Play
+	# Again shows the change without restarting the whole game.
+	SuspectModel.reset_config_cache()
+	_build_name_regexes()
+	_build_world()
+	# Before the mansion, because it decides which ground rooms skip their ceiling.
+	_build_upper_floor()
+	_build_mansion()
+	# Furniture before the suspects and the body: it also needs room_centers, and
+	# building it first means anything spawned afterwards lands on top of it
+	# rather than inside it.
+	furniture = load("res://Scripts/ManorDressing.gd").build(self, rooms_node, all_room_centers())
+	_index_furniture_rooms()
+	_spawn_npcs()
+	# After the mansion, since it needs room_centers to place anything.
+	crime_scene = load("res://Scripts/CrimeScene.gd").build(self, rooms_node)
+	_spawn_player()
+	_build_ui()
+
+
+# --------------------------------------------------------- selection screen --
+# A pre-game screen letting the player choose 2 to MAX_ACTIVE_SUSPECTS of the
+# 12-suspect roster, either by checking them individually or via a "Random N"
+# quick-select row. The roster is larger than the cap on purpose, so the cast
+# genuinely differs between games; the screen opens on a random legal cast
+# rather than everyone ticked, which would be over the cap on load.
+#
+# The mansion itself is always the same fixed 3x3 grid of 9 rooms; suspects who
+# aren't chosen simply don't get spawned into their room.
+
+func _build_selection_screen() -> void:
+	selection_layer = CanvasLayer.new()
+	add_child(selection_layer)
+
+	var bg := ColorRect.new()
+	bg.color = Color(0.05, 0.05, 0.08, 1.0)
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	selection_layer.add_child(bg)
+
+	var panel := Panel.new()
+	panel.set_anchors_preset(Control.PRESET_CENTER)
+	var panel_size := Vector2(640, 640)
+	panel.size = panel_size
+	panel.position = -panel_size / 2.0
+	selection_layer.add_child(panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.offset_left = 20
+	vbox.offset_top = 20
+	vbox.offset_right = -20
+	vbox.offset_bottom = -20
+	vbox.add_theme_constant_override("separation", 10)
+	panel.add_child(vbox)
+
+	var title := Label.new()
+	title.text = "Archibald Manor: A Clue Mystery"
+	title.add_theme_font_size_override("font_size", 24)
+	vbox.add_child(title)
+
+	var subtitle := Label.new()
+	subtitle.text = "Choose which %d of the %d suspects are in the manor tonight (2 to %d)." % [
+		GameManager.MAX_ACTIVE_SUSPECTS, GameManager.CHARACTERS.size(), GameManager.MAX_ACTIVE_SUSPECTS,
+	]
+	subtitle.autowrap_mode = TextServer.AUTOWRAP_WORD
+	vbox.add_child(subtitle)
+
+	var quick_label := Label.new()
+	quick_label.text = "Quick pick (random):"
+	quick_label.add_theme_font_size_override("font_size", 14)
+	quick_label.add_theme_color_override("font_color", Color(1, 1, 1, 0.75))
+	vbox.add_child(quick_label)
+
+	var quick_row := HBoxContainer.new()
+	quick_row.add_theme_constant_override("separation", 6)
+	vbox.add_child(quick_row)
+	for n in range(2, GameManager.MAX_ACTIVE_SUSPECTS + 1):
+		var qbtn := Button.new()
+		qbtn.text = str(n)
+		qbtn.custom_minimum_size = Vector2(38, 34)
+		qbtn.pressed.connect(_random_select.bind(n))
+		quick_row.add_child(qbtn)
+
+	var list_label := Label.new()
+	list_label.text = "Or pick specific suspects:"
+	list_label.add_theme_font_size_override("font_size", 14)
+	list_label.add_theme_color_override("font_color", Color(1, 1, 1, 0.75))
+	vbox.add_child(list_label)
+
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(0, 260)
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(scroll)
+
+	var list_vbox := VBoxContainer.new()
+	list_vbox.add_theme_constant_override("separation", 4)
+	list_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(list_vbox)
+
+	selection_checkboxes.clear()
+	for c in GameManager.CHARACTERS:
+		var id: String = c["id"]
+		var cb := CheckBox.new()
+		cb.text = "%s - %s" % [String(c["name"]), String(c["job"])]
+		cb.add_theme_color_override("font_color", NPC_COLORS.get(id, Color.WHITE))
+		cb.add_theme_color_override("font_hover_color", NPC_COLORS.get(id, Color.WHITE))
+		cb.toggled.connect(func(_pressed): _update_selection_count())
+		list_vbox.add_child(cb)
+		selection_checkboxes[id] = cb
+
+	selection_count_label = Label.new()
+	vbox.add_child(selection_count_label)
+
+	selection_log_checkbox = CheckBox.new()
+	selection_log_checkbox.text = "Write a dialogue log for this session (testing)"
+	selection_log_checkbox.button_pressed = GameManager.dialogue_log_enabled
+	selection_log_checkbox.tooltip_text = "Saves every line every suspect says to a markdown file in DialogueLogs/, alongside the game's ground truth, for reviewing hallucinations afterwards."
+	vbox.add_child(selection_log_checkbox)
+
+	var log_hint := Label.new()
+	log_hint.text = "Saved to DialogueLogs/ next to the project. The exact path is printed to the output console when the game starts."
+	log_hint.autowrap_mode = TextServer.AUTOWRAP_WORD
+	log_hint.add_theme_font_size_override("font_size", 12)
+	log_hint.add_theme_color_override("font_color", Color(1, 1, 1, 0.55))
+	vbox.add_child(log_hint)
+
+	# Case code. Blank means a fresh mystery, which is the normal path - this
+	# is for replaying one you liked, or handing me one that went wrong.
+	var code_row := HBoxContainer.new()
+	code_row.add_theme_constant_override("separation", 8)
+	vbox.add_child(code_row)
+
+	var code_label := Label.new()
+	code_label.text = "Case code (optional):"
+	code_row.add_child(code_label)
+
+	selection_seed_input = LineEdit.new()
+	selection_seed_input.placeholder_text = "leave blank for a new mystery"
+	selection_seed_input.custom_minimum_size = Vector2(220, 0)
+	selection_seed_input.tooltip_text = "Paste a code from a previous game to play that exact case again - same murderer, same schedules, same weapon. The code includes which suspects were in the house, so it will re-tick them for you."
+	selection_seed_input.text_changed.connect(_on_seed_input_changed)
+	code_row.add_child(selection_seed_input)
+
+	selection_seed_status = Label.new()
+	selection_seed_status.add_theme_font_size_override("font_size", 12)
+	code_row.add_child(selection_seed_status)
+
+	# The code from the game you just finished, so "that was a good one" is
+	# recoverable after the fact rather than needing foresight.
+	if GameManager.case_seed > 0:
+		var last := Label.new()
+		last.text = "Last case: %s" % GameManager.case_code()
+		last.add_theme_font_size_override("font_size", 12)
+		last.add_theme_color_override("font_color", Color(1, 1, 1, 0.55))
+		vbox.add_child(last)
+
+	var button_row := HBoxContainer.new()
+	button_row.add_theme_constant_override("separation", 10)
+	vbox.add_child(button_row)
+
+	# Was "Select All", which is no longer a legal selection now that the roster
+	# is bigger than the cap. Rerolling a full house is what that button was
+	# really being used for anyway.
+	var reroll_btn := Button.new()
+	reroll_btn.text = "Random %d" % GameManager.MAX_ACTIVE_SUSPECTS
+	reroll_btn.pressed.connect(func(): _random_select(GameManager.MAX_ACTIVE_SUSPECTS))
+	button_row.add_child(reroll_btn)
+
+	var none_btn := Button.new()
+	none_btn.text = "Clear"
+	none_btn.pressed.connect(func(): _set_all_checkboxes(false))
+	button_row.add_child(none_btn)
+
+	selection_start_button = Button.new()
+	selection_start_button.text = "Start Game"
+	selection_start_button.pressed.connect(_on_start_pressed)
+	button_row.add_child(selection_start_button)
+
+	# Deliberately last: _random_select() ticks boxes and then calls
+	# _update_selection_count(), which needs the count label and Start button
+	# to exist. Opening on a random legal cast beats opening on all 12, which
+	# would be over the cap and would greet the player with Start disabled.
+	_random_select(GameManager.MAX_ACTIVE_SUSPECTS)
+
+
+## Live feedback as the code is typed, and - the useful part - re-ticking the
+## suspects the code was generated with. Getting the cast wrong silently
+## produces a different mystery under the same seed, so it can't be left to the
+## player to remember who was in the house.
+func _on_seed_input_changed(text: String) -> void:
+	if text.strip_edges() == "":
+		selection_seed_status.text = ""
+		return
+	var parsed := GameManager.parse_case_code(text)
+	if parsed.has("error"):
+		# Show the parser's own reason rather than a blanket "invalid". The one
+		# that matters is "code is from an older cast": that code was perfectly
+		# good, the roster moved under it, and the player deserves to know the
+		# difference between a typo and a stale code.
+		selection_seed_status.text = String(parsed["error"])
+		selection_seed_status.add_theme_color_override("font_color", Color(1, 0.5, 0.5))
+		return
+	selection_seed_status.text = "ok"
+	selection_seed_status.add_theme_color_override("font_color", Color(0.5, 1, 0.6))
+	var ids: Array = parsed["ids"]
+	if not ids.is_empty():
+		for id in selection_checkboxes.keys():
+			selection_checkboxes[id].button_pressed = ids.has(String(id))
+		_update_selection_count()
+
+
+func _random_select(n: int) -> void:
+	var ids := []
+	for c in GameManager.CHARACTERS:
+		ids.append(c["id"])
+	ids.shuffle()
+	var chosen := {}
+	for i in range(min(n, ids.size())):
+		chosen[ids[i]] = true
+	for id in selection_checkboxes.keys():
+		selection_checkboxes[id].set_pressed_no_signal(chosen.has(id))
+	_update_selection_count()
+
+
+func _set_all_checkboxes(pressed: bool) -> void:
+	for id in selection_checkboxes.keys():
+		selection_checkboxes[id].set_pressed_no_signal(pressed)
+	_update_selection_count()
+
+
+## Keeps the count label and the Start button in step with the checkboxes.
+## Over-selecting is allowed to happen and then reported, rather than blocked
+## at the click: a checkbox that silently refuses to tick reads as broken,
+## whereas "9 selected - 1 over the limit of 8" tells the player exactly what
+## to do about it.
+func _update_selection_count() -> void:
+	var count := 0
+	for id in selection_checkboxes.keys():
+		if selection_checkboxes[id].button_pressed:
+			count += 1
+	var max_count: int = GameManager.MAX_ACTIVE_SUSPECTS
+	if count > max_count:
+		selection_count_label.text = "%d selected - %d over the limit of %d" % [
+			count, count - max_count, max_count,
+		]
+	elif count < 2:
+		selection_count_label.text = "%d selected - pick at least 2" % count
+	else:
+		selection_count_label.text = "%d of %d selected" % [count, max_count]
+
+	if count < 2 or count > max_count:
+		selection_count_label.add_theme_color_override("font_color", Color(1, 0.45, 0.45))
+		selection_start_button.disabled = true
+	else:
+		selection_count_label.add_theme_color_override("font_color", Color(0.55, 1, 0.55))
+		selection_start_button.disabled = false
+
+
+func _on_start_pressed() -> void:
+	var selected_ids := []
+	for c in GameManager.CHARACTERS: # keep CHARACTERS' stable order regardless of click order
+		var id: String = c["id"]
+		if selection_checkboxes[id].button_pressed:
+			selected_ids.append(id)
+	if selected_ids.size() < 2 or selected_ids.size() > GameManager.MAX_ACTIVE_SUSPECTS:
+		return
+
+	# Read before the selection screen is freed, and set before start_new_game()
+	# below - that's where the session's log file is created.
+	if selection_log_checkbox != null:
+		GameManager.dialogue_log_enabled = selection_log_checkbox.button_pressed
+	selection_log_checkbox = null
+
+	# An unreadable code is ignored rather than blocking the button - the
+	# status label next to the field already said so while it was being typed.
+	GameManager.requested_seed = 0
+	if selection_seed_input != null:
+		var parsed := GameManager.parse_case_code(selection_seed_input.text)
+		if not parsed.has("error"):
+			GameManager.requested_seed = int(parsed["seed"])
+	selection_seed_input = null
+	selection_seed_status = null
+
+	selection_layer.queue_free()
+	selection_layer = null
+	_start_game(selected_ids)
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if selection_layer != null:
+		return # still on the pre-game suspect-selection screen; nothing to handle yet
+	if event.is_action_pressed("ui_cancel"):
+		if dialogue_panel and dialogue_panel.visible:
+			close_dialogue()
+			get_viewport().set_input_as_handled()
+		elif group_panel and group_panel.visible:
+			close_group_dialogue()
+			get_viewport().set_input_as_handled()
+		elif accusation_panel and accusation_panel.visible:
+			close_accusation()
+			get_viewport().set_input_as_handled()
+		elif examine_panel and examine_panel.visible:
+			close_examine()
+			get_viewport().set_input_as_handled()
+		elif map_panel and map_panel.visible:
+			toggle_map()
+			get_viewport().set_input_as_handled()
+		elif notes_panel and notes_panel.visible:
+			toggle_notes()
+			get_viewport().set_input_as_handled()
+	elif event.is_action_pressed("toggle_notes"):
+		if not (dialogue_panel.visible or group_panel.visible or accusation_panel.visible or examine_panel.visible or map_panel.visible):
+			toggle_notes()
+	elif event.is_action_pressed("toggle_map"):
+		if not (dialogue_panel.visible or group_panel.visible or accusation_panel.visible or examine_panel.visible or notes_panel.visible):
+			toggle_map()
+	# exact_match, or a bare "1" fires these too: is_action_pressed() ignores
+	# modifiers by default, so Ctrl+1 and plain 1 would both match.
+	# Short-circuits before is_action_pressed, which errors on an action the
+	# InputMap does not have - and with DEBUG_KEYS off, it does not have these.
+	elif GameManager.DEBUG_KEYS and event.is_action_pressed("toggle_debug", false, true):
+		toggle_debug()
+	elif GameManager.DEBUG_KEYS and event.is_action_pressed("toggle_prompt_dump", false, true):
+		GameManager.debug_dump_group = not GameManager.debug_dump_group
+		print("[DEBUG] Group prompt dump %s - the next line spoken in a hall meetup will print its full payload." % ("ON" if GameManager.debug_dump_group else "OFF"))
+
+
+# ---------------------------------------------------------------- geometry --
+
+# The manor shell is about sixty boxes, and this used to mint a fresh BoxMesh,
+# StandardMaterial3D and BoxShape3D for every single one. The material was the
+# expensive part: forty-odd identical cream wall segments each carrying their
+# own material means forty-odd draw calls, because Godot can only batch geometry
+# that shares one. ManorBuilder learned this for the editor preview - its
+# _flush_individual() carries the same note - and these three caches are the
+# same fix on the runtime path. Keyed on the only things that vary, so the
+# result is pixel-identical.
+var _box_mesh_cache: Dictionary = {}
+var _box_material_cache: Dictionary = {}
+var _box_shape_cache: Dictionary = {}
+
+
+func add_solid_box(parent: Node3D, box_name: String, size: Vector3, pos: Vector3, color: Color) -> StaticBody3D:
+	var body := StaticBody3D.new()
+	body.name = box_name
+	parent.add_child(body)
+	body.position = pos
+
+	var mesh_instance := MeshInstance3D.new()
+	mesh_instance.mesh = _shared_box_mesh(size)
+	mesh_instance.material_override = _shared_box_material(color)
+	body.add_child(mesh_instance)
+
+	var coll := CollisionShape3D.new()
+	coll.shape = _shared_box_shape(size)
+	body.add_child(coll)
+
+	return body
+
+
+## One BoxMesh per distinct size. Shared, and never mutated after creation -
+## every caller here sets the size up front and then only moves the node.
+func _shared_box_mesh(size: Vector3) -> BoxMesh:
+	var key := "%.4f,%.4f,%.4f" % [size.x, size.y, size.z]
+	if not _box_mesh_cache.has(key):
+		var m := BoxMesh.new()
+		m.size = size
+		_box_mesh_cache[key] = m
+	return _box_mesh_cache[key]
+
+
+## One material per distinct colour. This is the one that actually buys the
+## draw calls back.
+func _shared_box_material(color: Color) -> StandardMaterial3D:
+	var key := color.to_html(true)
+	if not _box_material_cache.has(key):
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = color
+		_box_material_cache[key] = mat
+	return _box_material_cache[key]
+
+
+## One BoxShape3D per distinct size. Godot is happy for many bodies to share a
+## shape resource, and it saves the physics server rebuilding the same box.
+func _shared_box_shape(size: Vector3) -> BoxShape3D:
+	var key := "%.4f,%.4f,%.4f" % [size.x, size.y, size.z]
+	if not _box_shape_cache.has(key):
+		var sh := BoxShape3D.new()
+		sh.size = size
+		_box_shape_cache[key] = sh
+	return _box_shape_cache[key]
+
+
+func _build_world() -> void:
+	var env := WorldEnvironment.new()
+	var e := Environment.new()
+	e.background_mode = Environment.BG_COLOR
+	e.background_color = Color(0.05, 0.05, 0.08)
+	e.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	e.ambient_light_color = Color(0.55, 0.53, 0.58)
+	# Dropped from 0.7 when the rooms got ceilings. Ambient here is a flat colour
+	# term, so it ignores geometry entirely - at 0.7 it drowned out the chandeliers
+	# and left every room evenly lit and shapeless. Raise it back toward 0.7 if the
+	# manor now reads too dark for you.
+	e.ambient_light_energy = 0.5
+	env.environment = e
+	add_child(env)
+
+	var light := DirectionalLight3D.new()
+	light.rotation_degrees = Vector3(-55, -30, 0)
+	light.light_energy = 1.1
+	light.shadow_enabled = true
+	# The manor is 39m across and the ground plane is 60m, but the default shadow
+	# distance is 100m - so most of the shadow map's resolution was being spent on
+	# empty ground beyond the walls. Pulling it in sharpens the shadows that are
+	# actually on screen and drops two of the four cascade renders per frame.
+	light.directional_shadow_max_distance = 45.0
+	light.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS
+	add_child(light)
+
+	rooms_node = Node3D.new()
+	rooms_node.name = "Rooms"
+	add_child(rooms_node)
+
+	# A large safety-net ground plane beneath everything.
+	add_solid_box(rooms_node, "Ground", Vector3(60, 0.2, 60), Vector3(0, -0.6, 0), Color(0.1, 0.1, 0.12))
+
+
+## Stands up the second storey. ManorBuilder already knows how to do all of
+## this - levels, void cells for the plus-shaped footprint, the stair flight,
+## the hole it cuts in the slab above, and now the railings round that hole -
+## so this hands it the job rather than reimplementing any of it here. Its
+## ground floor is indexed but not emitted, because Main still builds that.
+func _build_upper_floor() -> void:
+	upper_room_centers.clear()
+	upper_grid_pos.clear()
+	_roofed_by_upper.clear()
+
+	var builder_script := load("res://Scripts/ManorBuilder.gd")
+	if builder_script == null:
+		push_warning("Main: ManorBuilder.gd is missing - the manor stays one storey.")
+		return
+
+	# Deliberately untyped. Typed as Node3D the analyzer rejects every line below
+	# it, because build_ground_plane and friends are properties of the script, not
+	# of Node3D. Loaded by path rather than by class_name for the same reason
+	# SuspectModel is: a global class can lose the filesystem-scan race on a fresh
+	# clone, and a path cannot.
+	var builder = builder_script.new()
+	builder.name = "UpperFloor"
+	# Every export has to be set BEFORE the node enters the tree: _ready() calls
+	# rebuild() the moment it does.
+	builder.build_ground_plane = false   # Main already lays one, 60m square
+	builder.build_ceilings = true        # the top floor genuinely needs a roof
+	builder.build_room_volumes = false   # nothing reads them yet
+	builder.build_room_labels = true
+	builder.save_to_scene = false
+	rooms_node.add_child(builder)
+	upper_floor = builder
+
+	for rname in builder.room_centers.keys():
+		var name_str := String(rname)
+		if int(builder.room_level.get(name_str, 0)) <= 0:
+			continue  # its copy of the ground floor, which Main owns
+		upper_room_centers[name_str] = builder.room_centers[name_str]
+		upper_grid_pos[name_str] = builder.grid_pos[name_str]
+		# Same cell one level down is the room this one is sitting on.
+		var cell: Vector2i = builder.grid_pos[name_str]
+		if cell.x >= 0 and cell.x < GRID.size() and cell.y >= 0 and cell.y < GRID[cell.x].size():
+			_roofed_by_upper[String(GRID[cell.x][cell.y])] = true
+
+	print("[Upstairs] %d rooms; %d ground rooms now roofed by the floor above" % [
+		upper_room_centers.size(), _roofed_by_upper.size()])
+
+
+## Every room in the building, both storeys, keyed by name. Names are unique
+## across floors, so one flat dictionary is enough - which is what lets the
+## furniture layout address an upstairs room exactly like a downstairs one.
+func all_room_centers() -> Dictionary:
+	var out := room_centers.duplicate()
+	for rname in upper_room_centers.keys():
+		out[rname] = upper_room_centers[rname]
+	return out
+
+
+func _room_center(row: int, col: int) -> Vector3:
+	return Vector3((col - 1) * PITCH, 0, (row - 1) * PITCH)
+
+
+func _has_neighbor(row: int, col: int, dir: String) -> bool:
+	match dir:
+		"north":
+			return row - 1 >= 0
+		"south":
+			return row + 1 <= 2
+		"west":
+			return col - 1 >= 0
+		_:
+			return col + 1 <= 2
+
+
+func _build_mansion() -> void:
+	for row in range(GRID.size()):
+		for col in range(GRID[row].size()):
+			var rname: String = GRID[row][col]
+			var center := _room_center(row, col)
+			room_centers[rname] = center
+			grid_pos[rname] = Vector2i(row, col)
+			_build_room(rname, center, row, col)
+
+
+func _build_room(rname: String, center: Vector3, row: int, col: int) -> void:
+	var color: Color = ROOM_COLORS.get(rname, Color(0.8, 0.75, 0.65))
+	# Floor tiles are sized to PITCH (room spacing), not CELL (room interior
+	# width), so neighboring floors butt up exactly against each other with
+	# no strip of missing floor under the doorway gaps in the walls.
+	add_solid_box(rooms_node, rname + "_Floor", Vector3(PITCH, 0.2, PITCH), Vector3(center.x, -0.1, center.z), color)
+
+	# Ceiling, mirroring the floor: PITCH-sized for the same reason, so adjacent
+	# rooms' ceilings butt together instead of leaving a slot of daylight over
+	# every doorway. Its underside sits exactly on WALL_H, level with the top of
+	# the walls. Darker than the floor because it never catches the directional
+	# light - once a room is roofed, everything inside is lit by the ambient term
+	# and by whatever fixtures ManorDressing hung from the ceiling.
+	# ...unless there is a whole room up there instead. The upper floor's slab
+	# sits in exactly this band, so a ceiling here would be a second slab in the
+	# same place - z-fighting at best, and a lid over the stairwell at worst.
+	if not _roofed_by_upper.has(rname):
+		add_solid_box(rooms_node, rname + "_Ceiling", Vector3(PITCH, 0.2, PITCH), Vector3(center.x, WALL_H + 0.1, center.z), color.darkened(0.45))
+
+	# Each shared boundary between two rooms must only be built ONCE, by
+	# whichever room "owns" it - otherwise two offset wall segments end up
+	# facing each other with a sliver of a gap between them that's narrower
+	# than the player and easy to get wedged in. South and east walls are
+	# always built by this room (covering both interior boundaries and the
+	# south/east edges of the mansion). North and west walls are only built
+	# here when there's no neighbor on that side (i.e. they're the outer
+	# edge of the mansion) - otherwise the neighboring room's south/east
+	# call already covers that same boundary.
+	_build_wall_side(rname, center, row, col, "south")
+	_build_wall_side(rname, center, row, col, "east")
+	if not _has_neighbor(row, col, "north"):
+		_build_wall_side(rname, center, row, col, "north")
+	if not _has_neighbor(row, col, "west"):
+		_build_wall_side(rname, center, row, col, "west")
+
+	# Room name, hung in the gap between the tallest ceiling fitting (which tops
+	# out at ManorDressing.CEILING_Y, 2.55) and the underside of the ceiling at
+	# WALL_H. It used to sit at 3.4 - above the walls entirely, which was fine
+	# while the rooms were open-topped and invisible the moment they got a roof.
+	var label := Label3D.new()
+	label.text = rname
+	label.position = Vector3(center.x, 2.72, center.z)
+	label.font_size = 56
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	rooms_node.add_child(label)
+
+
+func _build_wall_side(rname: String, center: Vector3, row: int, col: int, dir: String) -> void:
+	# On the room boundary, not at CELL/2 - see WALL_SPAN.
+	var half := WALL_SPAN / 2.0
+	# Each half of a doorway wall runs from the opening out to the far end of the
+	# wall's span, so the two segments plus the DOOR_W gap add up to WALL_SPAN and
+	# the doorway stays centred on the room.
+	var seg := (WALL_SPAN - DOOR_W) / 2.0
+	var off := DOOR_W / 2.0 + seg / 2.0
+	if dir == "north" or dir == "south":
+		var has_n := _has_neighbor(row, col, dir)
+		var z: float = center.z + (-half if dir == "north" else half)
+		var is_front_door := rname == "Hall" and dir == "south" and not has_n
+		if has_n or is_front_door:
+			add_solid_box(rooms_node, rname + "_" + dir + "_a", Vector3(seg, WALL_H, WALL_T), Vector3(center.x - off, WALL_H / 2.0, z), WALL_COLOR)
+			add_solid_box(rooms_node, rname + "_" + dir + "_b", Vector3(seg, WALL_H, WALL_T), Vector3(center.x + off, WALL_H / 2.0, z), WALL_COLOR)
+			if is_front_door:
+				_build_front_door(Vector3(center.x, 0, z))
+		else:
+			add_solid_box(rooms_node, rname + "_" + dir, Vector3(WALL_SPAN, WALL_H, WALL_T), Vector3(center.x, WALL_H / 2.0, z), WALL_COLOR)
+	else:
+		var has_n2 := _has_neighbor(row, col, dir)
+		var x: float = center.x + (-half if dir == "west" else half)
+		if has_n2:
+			add_solid_box(rooms_node, rname + "_" + dir + "_a", Vector3(WALL_T, WALL_H, seg), Vector3(x, WALL_H / 2.0, center.z - off), WALL_COLOR)
+			add_solid_box(rooms_node, rname + "_" + dir + "_b", Vector3(WALL_T, WALL_H, seg), Vector3(x, WALL_H / 2.0, center.z + off), WALL_COLOR)
+		else:
+			add_solid_box(rooms_node, rname + "_" + dir, Vector3(WALL_T, WALL_H, WALL_SPAN), Vector3(x, WALL_H / 2.0, center.z), WALL_COLOR)
+
+
+func _build_front_door(pos: Vector3) -> void:
+	var door := StaticBody3D.new()
+	door.name = "FrontDoor"
+	door.set_script(load("res://Scripts/Door.gd"))
+	rooms_node.add_child(door)
+	door.position = pos
+
+	var mesh := MeshInstance3D.new()
+	var box := BoxMesh.new()
+	box.size = Vector3(DOOR_W - 0.6, WALL_H - 0.3, 0.2)
+	mesh.mesh = box
+	mesh.position.y = box.size.y / 2.0
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.36, 0.2, 0.1)
+	mesh.material_override = mat
+	door.add_child(mesh)
+
+	var coll := CollisionShape3D.new()
+	var shape := BoxShape3D.new()
+	shape.size = box.size
+	coll.shape = shape
+	coll.position.y = mesh.position.y
+	door.add_child(coll)
+
+	front_door_node = door
+
+	# The door slab is 0.6 narrower and 0.3 shorter than the DOOR_W x WALL_H hole
+	# the wall left for it, so without a frame there is a 0.3 slot down each side
+	# and another over the top. Too narrow to walk through, wide enough to look
+	# straight out of the manor - which is what a flood fill at eye height finds
+	# once the corner gaps are sealed and this is the only opening left.
+	#
+	# Two jambs and a lintel in the wall colour. Deliberately butted rather than
+	# overlapped: the jambs run full height and the lintel spans only the door's
+	# own width, so no two same-facing faces ever share a plane.
+	var door_w := box.size.x
+	var door_h := box.size.y
+	var jamb := (DOOR_W - door_w) / 2.0
+	var head := WALL_H - door_h
+	add_solid_box(rooms_node, "FrontDoor_JambW", Vector3(jamb, WALL_H, WALL_T),
+			pos + Vector3(-(door_w + jamb) / 2.0, WALL_H / 2.0, 0.0), WALL_COLOR)
+	add_solid_box(rooms_node, "FrontDoor_JambE", Vector3(jamb, WALL_H, WALL_T),
+			pos + Vector3((door_w + jamb) / 2.0, WALL_H / 2.0, 0.0), WALL_COLOR)
+	add_solid_box(rooms_node, "FrontDoor_Head", Vector3(door_w, head, WALL_T),
+			pos + Vector3(0.0, door_h + head / 2.0, 0.0), WALL_COLOR)
+
+
+# -------------------------------------------------------------- characters --
+
+func _spawn_npcs() -> void:
+	npc_nodes.clear()
+	# Suspects used to have one fixed room each, so a random scatter inside it
+	# was always safe. Now placement comes from the generated schedule and two
+	# or three of them can legitimately end the night in the same room - a
+	# purely random offset would drop them inside one another's collision
+	# capsules. Spread them evenly round the room instead, by arrival order.
+	var occupancy := {}
+	for c in GameManager.active_characters():
+		var start_room := GameManager.room_for(String(c["id"]))
+		var nth := int(occupancy.get(start_room, 0))
+		occupancy[start_room] = nth + 1
+
+		var center: Vector3 = room_centers.get(start_room, Vector3.ZERO)
+		# The first suspect in a room stands near the middle; anyone joining
+		# them fans out on a ring well inside the walls, at a jittered angle so
+		# it doesn't look mechanical.
+		var angle := TAU * nth / float(CaseGenerator.MAX_PER_ROOM) + randf_range(-0.3, 0.3)
+		var radius := 0.0 if nth == 0 else 2.4
+		var offset := Vector3(cos(angle) * radius, 0, sin(angle) * radius)
+		offset += Vector3(randf_range(-0.6, 0.6), 0, randf_range(-0.6, 0.6))
+
+		var npc := CharacterBody3D.new()
+		npc.name = "NPC_" + c["id"]
+		npc.set_script(load("res://Scripts/NPCCharacter.gd"))
+		rooms_node.add_child(npc)
+		npc.character_id = c["id"]
+		npc.current_room = start_room
+		npc.position = Vector3(center.x + offset.x, 0, center.z + offset.z)
+		npc_nodes[c["id"]] = npc
+
+		# The body is whatever model has been dropped into
+		# Models/Suspects/<id>/, falling back to the colored capsule this used to
+		# build inline whenever that folder is still empty - so the cast can be
+		# moved over to real models one suspect at a time without the game caring
+		# how far through that you are. See Models/Suspects/README.md.
+		var visual := SuspectModel.build_visual(
+			String(c["id"]), NPC_COLORS.get(c["id"], Color.WHITE)
+		)
+		npc.add_child(visual)
+
+		var coll := CollisionShape3D.new()
+		var cshape := CapsuleShape3D.new()
+		cshape.height = 1.8
+		cshape.radius = 0.4
+		coll.shape = cshape
+		coll.position.y = 0.9
+		npc.add_child(coll)
+
+		var label := Label3D.new()
+		label.text = c["name"]
+		label.position.y = 2.15
+		label.font_size = 36
+		label.outline_size = 10
+		label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		npc.add_child(label)
+
+
+# ------------------------------------------------------ furniture culling --
+# The manor is nine walled rooms and every doorway is centred on its wall, so
+# from any room you can see into that room and the (up to four) rooms it has
+# doorways to, and nothing else - there is no diagonal sightline. Furniture in
+# the rest of the house can stop rendering entirely.
+#
+# Visibility does not touch physics: a hidden room's StaticBody3D pieces are
+# still solid, so nothing changes about where the player can walk. The room's
+# lamps ride along under the same switch, which is the larger saving of the two
+# - an OmniLight3D you cannot see is still in the light loop until it is hidden.
+
+## Furniture roots keyed by room name, filled in once ManorDressing has built
+## them. Empty until then, and empty forever if the furniture failed to load,
+## in which case the cull quietly does nothing.
+var furniture_rooms: Dictionary = {}
+
+## The room the cull last ran for, so walking around inside one room costs a
+## nearest-centre lookup and nothing else.
+var _culled_for_room := ""
+
+## The four grid steps a doorway can lead through. Typed, so the loop variable
+## comes out as a Vector2i rather than a Variant.
+const DOORWAY_STEPS: Array[Vector2i] = [
+	Vector2i(-1, 0), Vector2i(1, 0), Vector2i(0, -1), Vector2i(0, 1)
+]
+
+
+func _index_furniture_rooms() -> void:
+	furniture_rooms.clear()
+	_culled_for_room = ""
+	if not is_instance_valid(furniture):
+		return
+	for child in furniture.get_children():
+		if child is Node3D:
+			furniture_rooms[String(child.name)] = child
+
+
+func _process(_delta: float) -> void:
+	_update_furniture_visibility()
+
+
+func _update_furniture_visibility() -> void:
+	if furniture_rooms.is_empty() or not is_instance_valid(player):
+		return
+	var here := _room_at(player.global_position)
+	if here == _culled_for_room:
+		return
+	_culled_for_room = here
+
+	var in_sight := _rooms_in_sight(here)
+	for rname in furniture_rooms.keys():
+		var node: Node3D = furniture_rooms[rname]
+		if is_instance_valid(node):
+			node.visible = in_sight.has(rname)
+
+
+## The room you are standing in plus the ones it has doorways to, as a set. Uses
+## grid_pos rather than hardcoded neighbours so it survives any reshuffle of
+## GRID. An unrecognised room shows everything, on the principle that a bug here
+## should look like no optimisation rather than like an empty house.
+func _rooms_in_sight(here: String) -> Dictionary:
+	# Upstairs is its own plus-shaped grid and obeys the same rule, so standing on
+	# the landing lets the entire ground floor stop rendering, and vice versa. The
+	# two floors never appear in each other's neighbour set, which is exactly
+	# right: a solid slab sits between them everywhere except the stairwell.
+	if upper_grid_pos.has(here):
+		return _neighbours_of(here, upper_grid_pos)
+	if grid_pos.has(here):
+		return _neighbours_of(here, grid_pos)
+
+	var out := {}
+	for rname in furniture_rooms.keys():
+		out[rname] = true
+	return out
+
+
+## The room plus whatever it has doorways to, on one floor. Works off the
+## name -> cell mapping rather than a grid array, so a plus-shaped floor with
+## holes in it needs no bounds arithmetic: a cell with no room simply is not in
+## the dictionary.
+func _neighbours_of(here: String, cells: Dictionary) -> Dictionary:
+	var by_cell := {}
+	for rname in cells.keys():
+		by_cell[cells[rname]] = rname
+
+	var out := {here: true}
+	var cell: Vector2i = cells[here]
+	for step in DOORWAY_STEPS:
+		var probe: Vector2i = cell + step
+		if by_cell.has(probe):
+			out[String(by_cell[probe])] = true
+	return out
+
+
+# ------------------------------------------------------- room navigation --
+# NPCs wander freely within whichever room they currently belong to, but a
+# "go to <room>" command typed in the dialogue box needs an actual path
+# through the mansion's doorways since the 9 rooms are only connected to
+# their orthogonal neighbors in the 3x3 GRID. get_room_travel_waypoints()
+# does a short BFS over that grid and turns the room-name path into a list
+# of world-space points (each doorway crossing, then the room's center)
+# that NPCCharacter.begin_travel() walks through in order.
+
+func _build_room_name_lookup() -> void:
+	room_name_lookup.clear()
+	for row in GRID:
+		for rname in row:
+			room_name_lookup[String(rname).to_lower()] = rname
+
+
+## Builds the two regexes used to detect a movement instruction typed into
+## the dialogue box: "go/move/walk/head ... to ... <room>" and
+## "wait/stay ... in ... <room>". Reuses _sorted_escaped() (already used for
+## suspect-name coloring) so room names are escaped and tried longest-first.
+func _build_move_command_regexes() -> void:
+	var room_names := []
+	for row in GRID:
+		for rname in row:
+			room_names.append(rname)
+	var escaped := _sorted_escaped(room_names)
+	var alt := "|".join(escaped)
+
+	move_command_regex = RegEx.new()
+	move_command_regex.compile("(?i)\\b(?:go|move|walk|head)\\b[^\\n]{0,20}?\\bto\\b[^\\n]{0,12}?\\b(" + alt + ")\\b")
+
+	wait_command_regex = RegEx.new()
+	wait_command_regex.compile("(?i)\\b(?:wait|stay)\\b[^\\n]{0,15}?\\bin\\b[^\\n]{0,12}?\\b(" + alt + ")\\b")
+
+
+## Returns the canonical room name if `text` reads as a movement instruction,
+## or "" if it doesn't (including anything with a "?" in it, which is treated
+## as a real question - "Did you go to the kitchen?" should still be asked to
+## the character rather than acted on).
+func _parse_move_command(text: String) -> String:
+	if text.find("?") != -1:
+		return ""
+	if move_command_regex == null or wait_command_regex == null:
+		return ""
+	var m := move_command_regex.search(text)
+	if m == null:
+		m = wait_command_regex.search(text)
+	if m == null:
+		return ""
+	return String(room_name_lookup.get(m.get_string(1).to_lower(), ""))
+
+
+## Builds the five regexes behind the Hall meetup's floor-control orders. Kept
+## as separate intent patterns (silence / speak / leave / everyone / except)
+## rather than one big pattern per command, so the parser can combine them -
+## "everyone be quiet except Marcus" is the everyone pattern plus the silence
+## pattern plus the except pattern, with no dedicated rule of its own.
+func _build_group_command_regexes() -> void:
+	group_silence_regex = RegEx.new()
+	group_silence_regex.compile("(?i)\\b(?:be\\s+quiet|keep\\s+quiet|stay\\s+quiet|quiet\\s+down|say\\s+nothing|don't\\s+speak|do\\s+not\\s+speak|don't\\s+say|stop\\s+talking|hold\\s+your\\s+tongue|shut\\s+up|silence|silent)\\b")
+
+	group_speak_regex = RegEx.new()
+	group_speak_regex.compile("(?i)\\b(?:may\\s+speak|can\\s+speak|speak\\s+up|speak\\s+now|speak\\s+freely|go\\s+ahead|your\\s+turn|you\\s+may\\s+answer|answer\\s+me|say\\s+something|talk\\s+again|speak)\\b")
+
+	# "Leave" also covers being sent home, since dismissal already walks a
+	# suspect back to their own starting room - "go back to your room" and
+	# "leave" want the same thing to happen.
+	group_leave_regex = RegEx.new()
+	group_leave_regex.compile("(?i)\\b(?:leave|get\\s+out|step\\s+out|you\\s+can\\s+go|you\\s+may\\s+go|you're\\s+dismissed|dismissed|clear\\s+off|wait\\s+outside|go\\s+home|(?:go\\s+|head\\s+)?back\\s+to\\s+(?:your|their|his|her)\\s+(?:own\\s+)?rooms?|return\\s+to\\s+(?:your|their|his|her)\\s+(?:own\\s+)?rooms?)\\b")
+
+	group_everyone_regex = RegEx.new()
+	group_everyone_regex.compile("(?i)\\b(?:everyone|everybody|all\\s+of\\s+you|the\\s+room|nobody|no\\s+one)\\b")
+
+	group_except_regex = RegEx.new()
+	group_except_regex.compile("(?i)\\b(?:except|apart\\s+from|other\\s+than|but)\\b\\s+(.+)$")
+
+
+## Classifies a line typed into the meetup box. Returns {"kind": ..., "id": ...}
+## where kind is one of:
+##   "none"               ordinary line to the room - everyone un-muted answers
+##   "address"            aimed at one named suspect - only they answer
+##   "mute" / "unmute"    floor control for one suspect
+##   "silence_all"        shut the whole room up
+##   "silence_all_except" shut everyone up but one
+##   "unmute_all"         let the room speak again
+##   "dismiss"            send a suspect out of the Hall
+func _parse_group_command(text: String) -> Dictionary:
+	var none := {"kind": "none", "id": ""}
+	if group_silence_regex == null:
+		return none
+
+	# A question is never an order, matching how _parse_move_command treats
+	# "Did you go to the kitchen?" as something to ask rather than something to
+	# do. Without this, "Marcus, why were you so quiet last night?" silences him
+	# instead of asking him. Note this only suppresses ORDERS - a question
+	# beginning with a name is still routed to that suspect below, since
+	# "Marcus, where were you?" is the single most common thing you'll type.
+	var is_order := text.find("?") == -1
+
+	# Room-wide orders are checked first: "everyone be quiet except Marcus"
+	# also starts with no suspect's name, so it would otherwise fall through to
+	# the name-prefix branch and be treated as an ordinary question.
+	if is_order and group_everyone_regex.search(text) != null:
+		# Silence is tested before speech because the silence phrasings contain
+		# the word "speak" ("don't speak", "do not speak") and would otherwise
+		# be read as permission to talk.
+		if group_silence_regex.search(text) != null:
+			var ex := group_except_regex.search(text)
+			if ex != null:
+				var ex_id := _find_attendee_in(ex.get_string(1))
+				if ex_id != "":
+					return {"kind": "silence_all_except", "id": ex_id}
+			return {"kind": "silence_all", "id": ""}
+		# "Everyone, back to your rooms" - the one order you always need at the
+		# end of a confrontation, and the only way to clear the Hall in one go.
+		if group_leave_regex.search(text) != null:
+			return {"kind": "dismiss_all", "id": ""}
+		if group_speak_regex.search(text) != null:
+			return {"kind": "unmute_all", "id": ""}
+
+	# Everything else must be addressed to someone by name, at the START of the
+	# line. "Marcus, where were you?" is aimed at Marcus; "Where were you,
+	# Marcus?" is a question to the room that happens to mention him. Requiring
+	# the leading position keeps that distinction predictable instead of having
+	# any stray mention hijack the round.
+	var lead := _leading_attendee(text)
+	var id := String(lead["id"])
+	if id == "":
+		# No name at the front, but if the line mentions exactly one person in
+		# the room it's still aimed at them - "what about you, Tom?" obviously
+		# wants Tom, not a full round of everyone. Requiring the name to lead
+		# was too strict and made ordinary phrasing silently address the room.
+		# Two or more names stays room-wide, since "Marcus, is Tom lying?"
+		# genuinely is ambiguous about who should answer.
+		var named := _attendees_named_in(text)
+		if named.size() == 1:
+			return {"kind": "address", "id": String(named[0])}
+		return none
+
+	if is_order:
+		var rest := text.substr(int(lead["end"])).strip_edges().lstrip(",:;-. \t")
+		if group_leave_regex.search(rest) != null:
+			return {"kind": "dismiss", "id": id}
+		# "Marcus, go to the library" - the same movement command that works in
+		# a private conversation, which previously did nothing in here and got
+		# answered in character instead.
+		var room := _parse_move_command(rest)
+		if room != "" and room != MEETUP_ROOM:
+			return {"kind": "move", "id": id, "room": room}
+		if group_silence_regex.search(rest) != null:
+			return {"kind": "mute", "id": id}
+		if group_speak_regex.search(rest) != null:
+			return {"kind": "unmute", "id": id}
+	return {"kind": "address", "id": id}
+
+
+## Every attendee mentioned anywhere in `text`, in seating order. Used to work
+## out whether a line singles someone out.
+func _attendees_named_in(text: String) -> Array:
+	var out := []
+	for id in GameManager.group_chat.attendees:
+		if not name_regexes.has(id):
+			continue
+		if name_regexes[id].search(text) != null:
+			out.append(id)
+	return out
+
+
+## The attendee whose name appears earliest in `text`, or "" if none do.
+func _find_attendee_in(text: String) -> String:
+	var best := ""
+	var best_pos := -1
+	for id in GameManager.group_chat.attendees:
+		if not name_regexes.has(id):
+			continue
+		var m: RegExMatch = name_regexes[id].search(text)
+		if m == null:
+			continue
+		if best_pos == -1 or m.get_start() < best_pos:
+			best_pos = m.get_start()
+			best = id
+	return best
+
+
+## The attendee named at the very start of `text`, as {"id", "end"} where end
+## is the character offset just past their name. Longest match wins, so
+## "Marcus Sterling, ..." consumes the surname too instead of leaving it in
+## the remainder and confusing the intent match.
+func _leading_attendee(text: String) -> Dictionary:
+	var best_id := ""
+	var best_end := 0
+	for id in GameManager.group_chat.attendees:
+		if not name_regexes.has(id):
+			continue
+		var m: RegExMatch = name_regexes[id].search(text)
+		if m == null or m.get_start() != 0:
+			continue
+		if m.get_end() > best_end:
+			best_end = m.get_end()
+			best_id = id
+	return {"id": best_id, "end": best_end}
+
+
+## Shortest path (in room names, excluding `from_room`) between two rooms
+## over the 3x3 GRID, treating every orthogonally adjacent pair of rooms as
+## connected (every internal wall in the mansion has a doorway gap - see
+## _build_wall_side). Returns [] if there's no path or from == to.
+func _room_bfs_path(from_room: String, to_room: String) -> Array:
+	if from_room == to_room:
+		return []
+	if not grid_pos.has(from_room) or not grid_pos.has(to_room):
+		return []
+	var start: Vector2i = grid_pos[from_room]
+	var goal: Vector2i = grid_pos[to_room]
+
+	var visited := {start: true}
+	var prev := {}
+	var queue := [start]
+	var found := start == goal
+
+	while not queue.is_empty() and not found:
+		var cur: Vector2i = queue.pop_front()
+		for d in [Vector2i(-1, 0), Vector2i(1, 0), Vector2i(0, -1), Vector2i(0, 1)]:
+			var nxt: Vector2i = cur + d
+			if nxt.x < 0 or nxt.x >= GRID.size() or nxt.y < 0 or nxt.y >= GRID[0].size():
+				continue
+			if visited.has(nxt):
+				continue
+			visited[nxt] = true
+			prev[nxt] = cur
+			if nxt == goal:
+				found = true
+				break
+			queue.append(nxt)
+
+	if not found:
+		return []
+
+	var name_by_pos := {}
+	for rname in grid_pos.keys():
+		name_by_pos[grid_pos[rname]] = rname
+
+	var rev_path := [goal]
+	var cur2: Vector2i = goal
+	while cur2 != start:
+		cur2 = prev[cur2]
+		rev_path.append(cur2)
+	rev_path.reverse()
+
+	var out := []
+	for i in range(1, rev_path.size()):
+		out.append(name_by_pos[rev_path[i]])
+	return out
+
+
+## Turns a room-name path into world-space waypoints: the doorway crossing
+## (midpoint between the two room centers - always lines up with the
+## doorway gap since it's centered on that shared wall) followed by the
+## room's own center, for every room passed through on the way to `to_room`.
+func get_room_travel_waypoints(from_room: String, to_room: String) -> Array:
+	var path := _room_bfs_path(from_room, to_room)
+	if path.is_empty():
+		return []
+	var waypoints := []
+	var prev_center: Vector3 = room_centers.get(from_room, Vector3.ZERO)
+	for rname in path:
+		var center: Vector3 = room_centers[rname]
+		var doorway := (prev_center + center) / 2.0
+		doorway.y = 0.0
+		waypoints.append(doorway)
+		waypoints.append(center)
+		prev_center = center
+	return waypoints
+
+
+# ------------------------------------------------------------- hall meetup --
+# Suspects are gathered for a group confrontation one at a time, by telling
+# each of them "go to the hall" during a normal one-on-one conversation.
+# MAX_HALL_ATTENDEES caps how many will agree to crowd in there.
+
+## How many suspects currently count against the Hall's capacity. Deliberately
+## counts NPCs still walking there as well as those already standing in it -
+## begin_travel() sets current_room to the destination immediately, so an NPC
+## sent to the Hall occupies a slot from the moment they're ordered. Without
+## this you could order six suspects to the Hall in a row (each one passing the
+## capacity check while the previous ones are still in the corridors) and end
+## up with all six arriving.
+func hall_occupancy() -> int:
+	var count := 0
+	for id in npc_nodes.keys():
+		var npc = npc_nodes[id]
+		if is_instance_valid(npc) and npc.current_room == MEETUP_ROOM:
+			count += 1
+	return count
+
+
+## The suspects actually standing in the Hall right now - arrived, not still
+## en route. This is the guest list for a group confrontation, so it excludes
+## anyone still walking (state == "moving"); hall_occupancy() is the one that
+## counts those. Returned in stable CHARACTERS order rather than spawn or
+## arrival order, matching active_characters().
+func hall_attendees() -> Array:
+	var out := []
+	for c in GameManager.active_characters():
+		var id: String = c["id"]
+		if not npc_nodes.has(id):
+			continue
+		var npc = npc_nodes[id]
+		if is_instance_valid(npc) and npc.current_room == MEETUP_ROOM and npc.state != "moving":
+			out.append(id)
+	return out
+
+
+## Which room a world-space point sits in, by nearest room center. The 3x3
+## grid is evenly spaced and every room is the same size, so nearest-center is
+## exactly equivalent to a cell lookup here, without duplicating the PITCH/CELL
+## arithmetic that _build_mansion() already owns.
+## Height at which a point stops counting as being on the ground floor. Half
+## way up a wall: high enough that nothing standing downstairs ever trips it,
+## low enough that you are counted as upstairs before your feet reach the
+## landing, which is what matters on the way up the last few treads.
+const UPSTAIRS_Y := WALL_H * 0.5
+
+
+func _room_at(pos: Vector3) -> String:
+	# Nearest centre is only equivalent to a cell lookup within a single storey.
+	# This used to ignore Y completely, so standing on the landing resolved to
+	# whichever ground room was closest - the map said you were in the Hall, the
+	# furniture cull hid the room you were standing in, and a group confrontation
+	# could be opened straight through the stairwell floor.
+	if pos.y > UPSTAIRS_Y and not upper_room_centers.is_empty():
+		return _nearest_room(pos, upper_room_centers)
+	return _nearest_room(pos, room_centers)
+
+
+func _nearest_room(pos: Vector3, centres: Dictionary) -> String:
+	var best := ""
+	var best_d := INF
+	for rname in centres.keys():
+		var c: Vector3 = centres[rname]
+		var d := Vector2(pos.x - c.x, pos.z - c.z).length_squared()
+		if d < best_d:
+			best_d = d
+			best = rname
+	return best
+
+
+## True when the interact key should open a group confrontation rather than a
+## private interview: the detective is standing in the Hall and at least two
+## suspects have actually arrived there. This is the "I must be there to engage
+## the conversation" rule - a meetup cannot be opened, and therefore cannot
+## produce a single line of dialogue, from anywhere else in the mansion.
+func can_open_group_scene() -> bool:
+	if not is_instance_valid(player):
+		return false
+	if _room_at(player.global_position) != MEETUP_ROOM:
+		return false
+	return hall_attendees().size() >= 2
+
+
+## Sends an NPC walking toward `room_name`. Returns a status string Main uses
+## to write a short acknowledgement into the dialogue log: "moving",
+## "already_there", "already_heading", "hall_full" (the meetup room has hit
+## MAX_HALL_ATTENDEES), or "invalid" (unknown character/room).
+func command_npc_move(character_id: String, room_name: String) -> String:
+	if not npc_nodes.has(character_id) or not room_centers.has(room_name):
+		return "invalid"
+	var npc = npc_nodes[character_id]
+	if npc.current_room == room_name:
+		return "already_heading" if npc.state == "moving" else "already_there"
+	# Checked after the already-there cases above, so an NPC who is themselves
+	# in the Hall is never blocked by their own occupancy slot.
+	if room_name == MEETUP_ROOM and hall_occupancy() >= MAX_HALL_ATTENDEES:
+		return "hall_full"
+	var waypoints := get_room_travel_waypoints(npc.current_room, room_name)
+	if waypoints.is_empty():
+		return "invalid"
+	npc.begin_travel(waypoints, room_name)
+	return "moving"
+
+
+## Handles a movement instruction typed into the dialogue box instead of
+## sending it to GameManager/Ollama - logs the player's line plus a short
+## acknowledgement, and actually moves the NPC in the 3D world.
+func _handle_move_command(character_id: String, room_name: String, original_text: String) -> void:
+	var c := GameManager.get_character(character_id)
+	var short := String(c.get("short", "They"))
+	var status := command_npc_move(character_id, room_name)
+	var ack := ""
+	match status:
+		"moving":
+			ack = "%s heads off toward the %s." % [short, room_name]
+		"already_there":
+			ack = "%s is already in the %s." % [short, room_name]
+		"already_heading":
+			ack = "%s is already on the way to the %s." % [short, room_name]
+		"hall_full":
+			ack = "%s glances toward the hall. \"There's a crowd in there already - I'll wait my turn.\"" % short
+		_:
+			ack = "%s doesn't seem able to get there." % short
+	dialogue_log.append_text("[b]You:[/b] %s\n" % _colorize_names(original_text))
+	dialogue_log.append_text("[i]%s[/i]\n\n" % ack)
+
+
+func _spawn_player() -> void:
+	# Build the whole node hierarchy (collision shape, camera, interact ray)
+	# BEFORE the player enters the scene tree. Player.gd resolves $Camera3D
+	# and $Camera3D/InteractRay via @onready as soon as it enters the tree,
+	# so those children must already exist by the time add_child(player)
+	# below runs - otherwise they resolve to null.
+	player = CharacterBody3D.new()
+	player.name = "Player"
+	player.set_script(load("res://Scripts/Player.gd"))
+
+	var hall_center: Vector3 = room_centers.get("Hall", Vector3.ZERO)
+	player.position = Vector3(hall_center.x, 0.05, hall_center.z - 2.0)
+
+	var coll := CollisionShape3D.new()
+	var cshape := CapsuleShape3D.new()
+	cshape.height = 1.8
+	cshape.radius = 0.4
+	coll.shape = cshape
+	coll.position.y = 0.9
+	player.add_child(coll)
+
+	var cam := Camera3D.new()
+	cam.name = "Camera3D"
+	cam.position.y = 1.6
+	cam.current = true
+	player.add_child(cam)
+
+	var ray := RayCast3D.new()
+	ray.name = "InteractRay"
+	ray.target_position = Vector3(0, 0, -3.5)
+	ray.enabled = true
+	cam.add_child(ray)
+
+	add_child(player)
+
+
+# --------------------------------------------------------------------- UI --
+
+func _build_ui() -> void:
+	ui_layer = CanvasLayer.new()
+	add_child(ui_layer)
+
+	crosshair = ColorRect.new()
+	crosshair.color = Color(1, 1, 1, 0.85)
+	crosshair.size = Vector2(4, 4)
+	crosshair.set_anchors_preset(Control.PRESET_CENTER)
+	crosshair.position = Vector2(-2, -2)
+	crosshair.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui_layer.add_child(crosshair)
+
+	prompt_label = Label.new()
+	prompt_label.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	prompt_label.position = Vector2(-220, -80)
+	prompt_label.size = Vector2(440, 30)
+	prompt_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	prompt_label.add_theme_color_override("font_color", Color(1, 1, 1))
+	prompt_label.add_theme_font_size_override("font_size", 20)
+	prompt_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	prompt_label.visible = false
+	ui_layer.add_child(prompt_label)
+
+	var help := Label.new()
+	help.text = "WASD move | Space jump | Mouse look | Click or E to interact | Tab case notes | M map | Ctrl+1 debug | Ctrl+2 prompt dump | Esc release mouse"
+	help.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	help.position = Vector2(16, 16)
+	help.add_theme_font_size_override("font_size", 14)
+	help.add_theme_color_override("font_color", Color(1, 1, 1, 0.85))
+	help.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui_layer.add_child(help)
+
+	debug_label = Label.new()
+	debug_label.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	# Wide and tall enough for the full truth table (a header block plus one
+	# schedule row per suspect, and the murderer gets two).
+	debug_label.position = Vector2(-560, 16)
+	debug_label.size = Vector2(544, 420)
+	debug_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	debug_label.autowrap_mode = TextServer.AUTOWRAP_WORD
+	debug_label.add_theme_font_size_override("font_size", 14)
+	debug_label.add_theme_color_override("font_color", Color(1, 0.4, 0.4))
+	debug_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	debug_label.visible = false
+	_refresh_debug_label()
+	ui_layer.add_child(debug_label)
+
+	_build_dialogue_panel()
+	_build_group_panel()
+	_build_accusation_panel()
+	_build_notes_panel()
+	_build_examine_panel()
+	_build_map_panel()
+	_build_win_panel()
+
+
+## A small read-only panel for looking at a piece of evidence. Deliberately
+## plainer than the dialogue panel - there's nothing to type, and nothing to
+## wait for, so it's a title, a description and a way out.
+func _build_examine_panel() -> void:
+	examine_panel = Panel.new()
+	examine_panel.set_anchors_preset(Control.PRESET_CENTER)
+	examine_panel.size = Vector2(520, 300)
+	examine_panel.position = Vector2(-260, -150)
+	examine_panel.visible = false
+	ui_layer.add_child(examine_panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.add_theme_constant_override("separation", 10)
+	vbox.offset_left = 18
+	vbox.offset_top = 14
+	vbox.offset_right = -18
+	vbox.offset_bottom = -14
+	examine_panel.add_child(vbox)
+
+	examine_title_label = Label.new()
+	examine_title_label.add_theme_font_size_override("font_size", 20)
+	examine_title_label.add_theme_color_override("font_color", Color(1, 0.85, 0.6))
+	vbox.add_child(examine_title_label)
+
+	examine_body = RichTextLabel.new()
+	examine_body.bbcode_enabled = true
+	examine_body.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(examine_body)
+
+	var close_button := Button.new()
+	close_button.text = "Done"
+	close_button.pressed.connect(close_examine)
+	vbox.add_child(close_button)
+
+
+# -------------------------------------------------------------- the map --
+# The mansion is a fixed 3x3 GRID of identically sized rooms, so the floor plan
+# is already fully described by that constant. The map is therefore drawn as a
+# 3x3 GridContainer straight from GRID rather than rendered from the 3D world
+# with a second camera: it costs almost nothing, it can never drift out of sync
+# with the real layout, and a top-down render wouldn't show anything a labelled
+# cell doesn't.
+
+const MAP_CELL_SIZE := Vector2(236, 190)
+
+
+func _build_map_panel() -> void:
+	map_panel = Panel.new()
+	map_panel.set_anchors_preset(Control.PRESET_CENTER)
+	# Sized so the nine cells fit at their minimum (3 x 190 plus separations and
+	# margins) with room left for the title, hint and close button, and still
+	# sits comfortably inside the 1080-tall viewport.
+	map_panel.size = Vector2(800, 800)
+	map_panel.position = Vector2(-400, -400)
+	map_panel.visible = false
+	ui_layer.add_child(map_panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.offset_left = 16
+	vbox.offset_top = 16
+	vbox.offset_right = -16
+	vbox.offset_bottom = -16
+	vbox.add_theme_constant_override("separation", 10)
+	map_panel.add_child(vbox)
+
+	var title := Label.new()
+	title.text = "Archibald Manor"
+	title.add_theme_font_size_override("font_size", 22)
+	vbox.add_child(title)
+
+	var hint := Label.new()
+	hint.text = "The front door is at the bottom, off the Hall. Positions update while the map is open."
+	hint.add_theme_font_size_override("font_size", 13)
+	hint.add_theme_color_override("font_color", Color(1, 1, 1, 0.55))
+	vbox.add_child(hint)
+
+	var grid := GridContainer.new()
+	grid.columns = 3
+	grid.add_theme_constant_override("h_separation", 8)
+	grid.add_theme_constant_override("v_separation", 8)
+	grid.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(grid)
+
+	# GRID row 0 is the north side of the mansion and row 2 holds the Hall and
+	# the front door, so walking the rows in order already yields the map the
+	# right way up - entrance at the bottom, the way a floor plan is normally
+	# drawn - with no flipping needed.
+	for row in GRID:
+		for rname in row:
+			grid.add_child(_build_map_cell(String(rname)))
+
+	var close_btn := Button.new()
+	close_btn.text = "Close (M)"
+	close_btn.pressed.connect(toggle_map)
+	vbox.add_child(close_btn)
+
+	# Suspects keep walking between rooms while you're reading the map, so it
+	# has to keep up. Polling twice a second is far cheaper than reacting to
+	# every movement step, and is well inside the time it takes anyone to cross
+	# a room, so nothing visibly lags.
+	map_refresh_timer = Timer.new()
+	map_refresh_timer.wait_time = 0.5
+	map_refresh_timer.autostart = true
+	map_refresh_timer.timeout.connect(_on_map_refresh_timer)
+	add_child(map_refresh_timer)
+
+
+func _build_map_cell(rname: String) -> Control:
+	var is_murder_room := rname == _murder_room_name()
+
+	var cell := PanelContainer.new()
+	cell.custom_minimum_size = MAP_CELL_SIZE
+	cell.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cell.size_flags_vertical = Control.SIZE_EXPAND_FILL
+
+	# Darkened room colors so each cell is recognisably the same room you see
+	# underfoot in 3D, while staying dark enough for white text to sit on.
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = _map_base_color(rname)
+	sb.set_border_width_all(3 if is_murder_room else 1)
+	sb.border_color = Color(0.9, 0.25, 0.25) if is_murder_room else Color(1, 1, 1, 0.25)
+	sb.set_corner_radius_all(6)
+	sb.content_margin_left = 12
+	sb.content_margin_right = 12
+	sb.content_margin_top = 10
+	sb.content_margin_bottom = 10
+	cell.add_theme_stylebox_override("panel", sb)
+
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 4)
+	cell.add_child(v)
+
+	var name_label := Label.new()
+	name_label.text = rname
+	name_label.add_theme_font_size_override("font_size", 18)
+	v.add_child(name_label)
+
+	if is_murder_room:
+		var murder_label := Label.new()
+		murder_label.text = "MURDER SCENE"
+		murder_label.add_theme_font_size_override("font_size", 13)
+		murder_label.add_theme_color_override("font_color", Color(1, 0.42, 0.42))
+		v.add_child(murder_label)
+
+	var occupants := RichTextLabel.new()
+	occupants.bbcode_enabled = true
+	occupants.fit_content = true
+	occupants.scroll_active = false
+	occupants.add_theme_font_size_override("normal_font_size", 15)
+	occupants.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	v.add_child(occupants)
+
+	map_room_cells[rname] = cell
+	map_room_occupants[rname] = occupants
+	return cell
+
+
+func _map_base_color(rname: String) -> Color:
+	var c: Color = ROOM_COLORS.get(rname, Color(0.8, 0.75, 0.65))
+	return c.darkened(0.62)
+
+
+## GameManager stores the murder room with its article ("the Billiard Room")
+## because that string is dropped straight into the prose of every suspect
+## briefing. The map needs the bare name to match against GRID.
+func _murder_room_name() -> String:
+	return String(GameManager.murder_room).trim_prefix("the ").strip_edges()
+
+
+func _on_map_refresh_timer() -> void:
+	if map_panel != null and map_panel.visible:
+		_refresh_map()
+
+
+func toggle_map() -> void:
+	if win_panel.visible:
+		return
+	map_panel.visible = not map_panel.visible
+	if map_panel.visible:
+		_refresh_map()
+		player.set_mouse_captured(false)
+	elif not dialogue_panel.visible and not accusation_panel.visible and not notes_panel.visible:
+		player.set_mouse_captured(true)
+
+
+## Repaints who is standing where. Only the occupant text and the "you are
+## here" tint change - the cells themselves are built once, since the floor
+## plan never changes during a game.
+func _refresh_map() -> void:
+	# Upstairs rooms have no cell of their own on the map, so the detective is
+	# marked on the ground room directly beneath them and the cell says which
+	# upstairs room it is. Better than a map with no "you are here" on it at all.
+	var player_room := ""
+	var player_upstairs := ""
+	if is_instance_valid(player):
+		var here := _room_at(player.global_position)
+		if upper_grid_pos.has(here):
+			player_upstairs = here
+			var ucell: Vector2i = upper_grid_pos[here]
+			if ucell.x >= 0 and ucell.x < GRID.size() and ucell.y >= 0 and ucell.y < GRID[ucell.x].size():
+				player_room = String(GRID[ucell.x][ucell.y])
+		else:
+			player_room = here
+
+	# Bucket the suspects by room in a single pass, rather than scanning all
+	# eight NPCs again for each of the nine cells.
+	#
+	# Placed by actual world position, NOT by NPCCharacter.current_room:
+	# begin_travel() sets current_room to the DESTINATION the moment a suspect
+	# sets off, so trusting it would teleport someone across the map the
+	# instant they were told "go to the Library", while they're still visibly
+	# in the Kitchen. _room_at() is the same function that places the
+	# detective, so everyone on the map is located the same honest way.
+	var by_room := {}
+	for id in npc_nodes.keys():
+		var npc = npc_nodes[id]
+		if not is_instance_valid(npc):
+			continue
+		var r := _room_at(npc.global_position)
+		if not by_room.has(r):
+			by_room[r] = []
+		by_room[r].append(String(id))
+
+	for rname in map_room_occupants.keys():
+		var key := String(rname)
+		var lines := []
+		if key == player_room:
+			if player_upstairs != "":
+				lines.append("[b]You are upstairs, in the %s[/b]" % player_upstairs)
+			else:
+				lines.append("[b]You are here[/b]")
+		for id in by_room.get(key, []):
+			var c := GameManager.get_character(String(id))
+			var col: Color = NPC_COLORS.get(id, Color.WHITE)
+			var entry := "[color=#%s]%s[/color]" % [col.to_html(false), String(c.get("name", id))]
+			# Someone mid-walk is only passing through, which matters if you're
+			# about to head over expecting to find them there.
+			var npc2 = npc_nodes.get(id)
+			if is_instance_valid(npc2) and String(npc2.state) == "moving":
+				entry += " [color=#ffffff66][i]- on the move[/i][/color]"
+			lines.append(entry)
+
+		var label: RichTextLabel = map_room_occupants[key]
+		if lines.is_empty():
+			label.text = "[color=#ffffff55][i]empty[/i][/color]"
+		else:
+			label.text = "\n".join(PackedStringArray(lines))
+
+		# A gentle lift on the room you're standing in. Deliberately a
+		# background change rather than a border one, so it can't be confused
+		# with - or painted over - the murder scene's red border.
+		var cell: PanelContainer = map_room_cells[key]
+		var sb := cell.get_theme_stylebox("panel") as StyleBoxFlat
+		var base := _map_base_color(key)
+		if sb == null:
+			continue
+		if key == player_room:
+			sb.bg_color = base.lightened(0.18)
+		else:
+			sb.bg_color = base
+
+
+## RichTextLabel keeps a separate size for each BBCode style, so bumping only
+## "normal_font_size" would leave [b] and [i] runs - which the transcripts use
+## for speaker names and actions - stuck at the default. Set every variant.
+func _scale_rich_text_font(rt: RichTextLabel) -> void:
+	for key in ["normal_font_size", "bold_font_size", "italics_font_size", "bold_italics_font_size", "mono_font_size"]:
+		rt.add_theme_font_size_override(key, DIALOGUE_FONT_SIZE)
+
+
+## The question boxes open one row high and grow as the text wraps, stopping at
+## INPUT_MAX_ROWS and scrolling past that. TextEdit has no maximum height, so
+## the growth is driven by hand off text_changed.
+##
+## Counts VISUAL rows rather than logical lines: get_line_count() is 1 for a
+## long wrapped question, and it is the wrapped rows the player can actually
+## see that the box has to be tall enough to show.
+##
+## The row height and the border are read back out of the theme instead of
+## being hardcoded, so the box still measures itself correctly if
+## DIALOGUE_FONT_SIZE is ever retuned.
+func _fit_input_height(box: TextEdit) -> void:
+	if box == null:
+		return
+	var rows := 0
+	for i in range(box.get_line_count()):
+		rows += 1 + box.get_line_wrap_count(i)
+	var unit: float = box.get_theme_font("font").get_height(DIALOGUE_FONT_SIZE) + box.get_theme_constant("line_spacing")
+	var sb := box.get_theme_stylebox("normal")
+	var chrome: float = sb.get_margin(SIDE_TOP) + sb.get_margin(SIDE_BOTTOM)
+	box.custom_minimum_size.y = clampi(rows, 1, INPUT_MAX_ROWS) * unit + chrome
+
+
+## Enter sends the line instead of typing a newline into it.
+##
+## Godot emits a Control's gui_input signal BEFORE running the node's own key
+## handling, so marking the event handled here means the TextEdit never sees
+## the key at all and no newline is inserted.
+##
+## There is deliberately no Shift+Enter escape hatch. A literal newline inside
+## a question would break out of the Markdown blockquote DialogueLog writes it
+## into, and would have to be scrubbed back out before the prompt and the log
+## anyway - and the box is meant to grow by wrapping, not by hard breaks.
+##
+## Returns true when the caller should send. Callers re-check their own state:
+## both send functions already bail on empty text, and the group one also bails
+## mid-round, which is the case the box is non-editable for.
+func _input_box_submitted(box: TextEdit, event: InputEvent) -> bool:
+	if not (event is InputEventKey):
+		return false
+	var key := event as InputEventKey
+	if not key.pressed or key.echo:
+		return false
+	# Tab would otherwise be typed into the question as literal whitespace, which
+	# then travels all the way to the model and the log. LineEdit moved focus on
+	# Tab; swallowing it is the closer of the two behaviours, and there is nowhere
+	# useful to tab to in a two-control panel anyway.
+	if key.keycode == KEY_TAB:
+		box.accept_event()
+		return false
+	if key.keycode != KEY_ENTER and key.keycode != KEY_KP_ENTER:
+		return false
+	# accept_event() marks the event handled on the box's own viewport, which is
+	# what stops TextEdit's own key handling from running and typing a newline.
+	# It is a no-op if the box somehow is not in the tree, so no null viewport.
+	box.accept_event()
+	return true
+
+
+func _on_dialogue_input_gui(event: InputEvent) -> void:
+	if _input_box_submitted(dialogue_input, event):
+		_send_question()
+
+
+func _on_group_input_gui(event: InputEvent) -> void:
+	if _input_box_submitted(group_input, event):
+		_send_group_line()
+
+
+func _build_dialogue_panel() -> void:
+	dialogue_panel = Panel.new()
+	dialogue_panel.set_anchors_preset(Control.PRESET_CENTER)
+	dialogue_panel.size = Vector2(1368, 800)
+	dialogue_panel.position = Vector2(-684, -400)
+	dialogue_panel.visible = false
+	ui_layer.add_child(dialogue_panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.offset_left = 16
+	vbox.offset_top = 16
+	vbox.offset_right = -16
+	vbox.offset_bottom = -16
+	vbox.add_theme_constant_override("separation", 8)
+	dialogue_panel.add_child(vbox)
+
+	dialogue_name_label = Label.new()
+	dialogue_name_label.add_theme_font_size_override("font_size", 33)
+	vbox.add_child(dialogue_name_label)
+
+	dialogue_log = RichTextLabel.new()
+	# Floor, not the height it renders at - the log is EXPAND_FILL and normally
+	# sits around 500. It only matters when the question box has grown to its
+	# full three rows, which takes 122px out of the log; 360 leaves that fitting
+	# inside the panel with room to spare rather than three pixels short.
+	dialogue_log.custom_minimum_size = Vector2(0, 360)
+	dialogue_log.bbcode_enabled = true
+	_scale_rich_text_font(dialogue_log)
+	dialogue_log.scroll_following = true
+	# The log is the only part of the panel worth growing - the name, status and
+	# buttons all want their natural height - so it takes every spare pixel.
+	# Without this the extra panel height would be left as dead space.
+	dialogue_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(dialogue_log)
+
+	dialogue_status_label = Label.new()
+	dialogue_status_label.text = ""
+	dialogue_status_label.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	dialogue_status_label.add_theme_color_override("font_color", Color(1, 0.8, 0.3))
+	vbox.add_child(dialogue_status_label)
+
+	var hbox := HBoxContainer.new()
+	vbox.add_child(hbox)
+
+	# TextEdit rather than LineEdit purely because LineEdit cannot wrap: it is
+	# single-line by design, with no wrap mode and no line count. Everything the
+	# panel relies on - placeholder_text, editable, grab_focus, text - carries
+	# over unchanged; only Enter has to be taken back by hand, in
+	# _on_dialogue_input_gui.
+	dialogue_input = TextEdit.new()
+	dialogue_input.placeholder_text = "Type your question..."
+	dialogue_input.custom_minimum_size = Vector2(1180, 0)
+	dialogue_input.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	dialogue_input.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	# Left off deliberately: it would grow the box without limit. _fit_input_height
+	# does the same job with a cap.
+	dialogue_input.scroll_fit_content_height = false
+	dialogue_input.gui_input.connect(_on_dialogue_input_gui)
+	dialogue_input.text_changed.connect(func(): _fit_input_height(dialogue_input))
+	hbox.add_child(dialogue_input)
+	_fit_input_height(dialogue_input)
+
+	dialogue_ask_button = Button.new()
+	dialogue_ask_button.text = "Ask"
+	dialogue_ask_button.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	# Without this the button inherits FILL and stretches to match a grown input
+	# box. Pinned to the bottom instead, so it stays button-sized and sits level
+	# with the last line of the question.
+	dialogue_ask_button.size_flags_vertical = Control.SIZE_SHRINK_END
+	dialogue_ask_button.pressed.connect(_send_question)
+	hbox.add_child(dialogue_ask_button)
+
+	var close_btn := Button.new()
+	close_btn.text = "Close (Esc)"
+	close_btn.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	close_btn.pressed.connect(close_dialogue)
+	vbox.add_child(close_btn)
+
+
+## The Hall meetup panel. Deliberately wider than the one-on-one panel: group
+## lines are short but there are several per round, and each is prefixed with
+## a speaker name, so the log needs the extra room to stay readable.
+func _build_group_panel() -> void:
+	group_panel = Panel.new()
+	group_panel.set_anchors_preset(Control.PRESET_CENTER)
+	group_panel.size = Vector2(1764, 900)
+	group_panel.position = Vector2(-882, -450)
+	group_panel.visible = false
+	ui_layer.add_child(group_panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.offset_left = 16
+	vbox.offset_top = 16
+	vbox.offset_right = -16
+	vbox.offset_bottom = -16
+	vbox.add_theme_constant_override("separation", 8)
+	group_panel.add_child(vbox)
+
+	var title := Label.new()
+	title.text = "The Hall"
+	title.add_theme_font_size_override("font_size", 33)
+	vbox.add_child(title)
+
+	# One name chip per attendee, in that suspect's own body color, so the log
+	# below reads against a visible cast list.
+	group_roster = HBoxContainer.new()
+	group_roster.add_theme_constant_override("separation", 14)
+	vbox.add_child(group_roster)
+
+	group_log = RichTextLabel.new()
+	# Same floor-not-height reasoning as the one-on-one panel's log.
+	group_log.custom_minimum_size = Vector2(0, 400)
+	group_log.bbcode_enabled = true
+	_scale_rich_text_font(group_log)
+	group_log.scroll_following = true
+	# Same reasoning as the one-on-one panel: the roster, status and input row
+	# want their natural height, so the spare pixels all go to the transcript.
+	group_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(group_log)
+
+	group_status_label = Label.new()
+	group_status_label.text = ""
+	group_status_label.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	group_status_label.add_theme_color_override("font_color", Color(1, 0.8, 0.3))
+	vbox.add_child(group_status_label)
+
+	var hbox := HBoxContainer.new()
+	vbox.add_child(hbox)
+
+	# Same swap and same reasoning as the one-on-one box. Wider, so it takes
+	# about 76 characters before it wraps rather than about 57.
+	group_input = TextEdit.new()
+	group_input.placeholder_text = "Say something to the room..."
+	group_input.custom_minimum_size = Vector2(1570, 0)
+	group_input.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	group_input.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	group_input.scroll_fit_content_height = false
+	group_input.gui_input.connect(_on_group_input_gui)
+	group_input.text_changed.connect(func(): _fit_input_height(group_input))
+	hbox.add_child(group_input)
+	_fit_input_height(group_input)
+
+	group_say_button = Button.new()
+	group_say_button.text = "Say"
+	group_say_button.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	group_say_button.size_flags_vertical = Control.SIZE_SHRINK_END
+	group_say_button.pressed.connect(_send_group_line)
+	hbox.add_child(group_say_button)
+
+	var group_close_btn := Button.new()
+	group_close_btn.text = "Leave the room (Esc)"
+	group_close_btn.add_theme_font_size_override("font_size", DIALOGUE_FONT_SIZE)
+	group_close_btn.pressed.connect(close_group_dialogue)
+	vbox.add_child(group_close_btn)
+
+
+func _build_accusation_panel() -> void:
+	accusation_panel = Panel.new()
+	accusation_panel.set_anchors_preset(Control.PRESET_CENTER)
+	accusation_panel.size = Vector2(480, 480)
+	accusation_panel.position = Vector2(-240, -240)
+	accusation_panel.visible = false
+	ui_layer.add_child(accusation_panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.offset_left = 16
+	vbox.offset_top = 16
+	vbox.offset_right = -16
+	vbox.offset_bottom = -16
+	vbox.add_theme_constant_override("separation", 10)
+	accusation_panel.add_child(vbox)
+
+	var title := Label.new()
+	title.text = "Who is the murderer?"
+	title.add_theme_font_size_override("font_size", 22)
+	vbox.add_child(title)
+
+	var subtitle := Label.new()
+	subtitle.text = "Select a suspect below and make your final accusation."
+	subtitle.autowrap_mode = TextServer.AUTOWRAP_WORD
+	vbox.add_child(subtitle)
+
+	# One button per suspect actually in this game (matches the Case Notes
+	# tabs), colored to match their body color in the mansion. Clicking one
+	# selects it (highlighted, like the notes tabs) rather than typing a name.
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(0, 240)
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(scroll)
+
+	var list_vbox := VBoxContainer.new()
+	list_vbox.add_theme_constant_override("separation", 4)
+	list_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(list_vbox)
+
+	accusation_suspect_buttons.clear()
+	for c in GameManager.active_characters():
+		var id: String = c["id"]
+		var color: Color = NPC_COLORS.get(id, Color.WHITE)
+		var btn := Button.new()
+		btn.text = String(c["name"])
+		btn.custom_minimum_size = Vector2(0, 36)
+		btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		btn.add_theme_font_size_override("font_size", 16)
+		btn.add_theme_color_override("font_color", color)
+		btn.add_theme_color_override("font_hover_color", color)
+		btn.add_theme_color_override("font_pressed_color", color)
+		btn.pressed.connect(_select_accusation_suspect.bind(id))
+		list_vbox.add_child(btn)
+		accusation_suspect_buttons[id] = btn
+
+	var hbox := HBoxContainer.new()
+	vbox.add_child(hbox)
+
+	accusation_accuse_button = Button.new()
+	accusation_accuse_button.text = "Accuse"
+	accusation_accuse_button.disabled = true
+	accusation_accuse_button.pressed.connect(_submit_accusation)
+	hbox.add_child(accusation_accuse_button)
+
+	var cancel_btn := Button.new()
+	cancel_btn.text = "Cancel (Esc)"
+	cancel_btn.pressed.connect(close_accusation)
+	hbox.add_child(cancel_btn)
+
+	accusation_result_label = Label.new()
+	accusation_result_label.add_theme_color_override("font_color", Color(1, 0.5, 0.5))
+	accusation_result_label.autowrap_mode = TextServer.AUTOWRAP_WORD
+	vbox.add_child(accusation_result_label)
+
+
+## Highlights the clicked suspect button (matching the Case Notes tab style)
+## and enables the Accuse button once something is selected.
+func _select_accusation_suspect(id: String) -> void:
+	accusation_selected_id = id
+	accusation_accuse_button.disabled = false
+	for bid in accusation_suspect_buttons.keys():
+		var btn: Button = accusation_suspect_buttons[bid]
+		if bid == id:
+			btn.add_theme_stylebox_override("normal", _selected_tab_stylebox())
+			btn.add_theme_stylebox_override("hover", _selected_tab_stylebox())
+		else:
+			btn.remove_theme_stylebox_override("normal")
+			btn.remove_theme_stylebox_override("hover")
+
+
+func _build_notes_panel() -> void:
+	notes_panel = Panel.new()
+	notes_panel.set_anchors_preset(Control.PRESET_CENTER)
+
+	# Twice the original size (760x520 -> 1520x1040), but clamped so it can
+	# never overflow off-screen on a smaller monitor/window.
+	var vp_size: Vector2 = get_viewport().get_visible_rect().size
+	var max_size: Vector2 = vp_size - Vector2(40, 40)
+	var panel_size := Vector2(min(1520.0, max_size.x), min(1040.0, max_size.y))
+	notes_panel.size = panel_size
+	notes_panel.position = -panel_size / 2.0
+	notes_panel.visible = false
+	ui_layer.add_child(notes_panel)
+
+	var outer_vbox := VBoxContainer.new()
+	outer_vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	outer_vbox.offset_left = 16
+	outer_vbox.offset_top = 16
+	outer_vbox.offset_right = -16
+	outer_vbox.offset_bottom = -16
+	outer_vbox.add_theme_constant_override("separation", 10)
+	notes_panel.add_child(outer_vbox)
+
+	var title := Label.new()
+	title.text = "Case Notes"
+	title.add_theme_font_size_override("font_size", 24)
+	outer_vbox.add_child(title)
+
+	var hbox := HBoxContainer.new()
+	hbox.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	hbox.add_theme_constant_override("separation", 14)
+	outer_vbox.add_child(hbox)
+
+	# Left column: one tab per suspect, colored to match their body color in
+	# the mansion, dimmed if you haven't talked to them yet, with a small
+	# red dot if their Slipups section has real content worth checking.
+	var tabs_vbox := VBoxContainer.new()
+	tabs_vbox.custom_minimum_size = Vector2(190, 0)
+	tabs_vbox.add_theme_constant_override("separation", 6)
+	hbox.add_child(tabs_vbox)
+
+	notes_tab_buttons.clear()
+	notes_flag_dots.clear()
+
+	# Evidence sits above the suspects, and isn't one of them: it's the case
+	# file rather than an interview. Same tab machinery, reserved id.
+	var ev_row := HBoxContainer.new()
+	ev_row.add_theme_constant_override("separation", 6)
+	tabs_vbox.add_child(ev_row)
+	var ev_btn := Button.new()
+	ev_btn.text = "The Scene"
+	ev_btn.custom_minimum_size = Vector2(160, 36)
+	ev_btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	ev_btn.add_theme_font_size_override("font_size", 16)
+	ev_btn.add_theme_color_override("font_color", Color(1, 0.85, 0.6))
+	ev_btn.add_theme_color_override("font_hover_color", Color(1, 0.85, 0.6))
+	ev_btn.add_theme_color_override("font_pressed_color", Color(1, 0.85, 0.6))
+	ev_btn.pressed.connect(func(): _select_notes_character(EVIDENCE_TAB))
+	ev_row.add_child(ev_btn)
+	notes_tab_buttons[EVIDENCE_TAB] = ev_btn
+
+	var sep := HSeparator.new()
+	tabs_vbox.add_child(sep)
+
+	for c in GameManager.active_characters():
+		var id: String = c["id"]
+		var color: Color = NPC_COLORS.get(id, Color.WHITE)
+
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 6)
+		tabs_vbox.add_child(row)
+
+		var btn := Button.new()
+		btn.text = String(c["short"])
+		btn.custom_minimum_size = Vector2(160, 36)
+		btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		btn.add_theme_font_size_override("font_size", 16)
+		btn.add_theme_color_override("font_color", color)
+		btn.add_theme_color_override("font_hover_color", color)
+		btn.add_theme_color_override("font_pressed_color", color)
+		btn.pressed.connect(func(): _select_notes_character(id))
+		row.add_child(btn)
+
+		var dot := ColorRect.new()
+		dot.color = Color(1, 0.25, 0.25)
+		dot.custom_minimum_size = Vector2(10, 10)
+		dot.size = Vector2(10, 10)
+		dot.visible = false
+		row.add_child(dot)
+
+		notes_tab_buttons[id] = btn
+		notes_flag_dots[id] = dot
+
+	# Right pane: the selected suspect's Timeline / Motive / Slipups.
+	notes_log = RichTextLabel.new()
+	notes_log.bbcode_enabled = true
+	notes_log.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	notes_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	notes_log.add_theme_font_size_override("normal_font_size", 18)
+	# Breathing room for the TIMELINE table, which would otherwise butt the
+	# time straight up against the claim.
+	notes_log.add_theme_constant_override("table_h_separation", 14)
+	notes_log.add_theme_constant_override("table_v_separation", 6)
+	hbox.add_child(notes_log)
+
+	var close_btn := Button.new()
+	close_btn.text = "Close (Tab)"
+	close_btn.pressed.connect(toggle_notes)
+	outer_vbox.add_child(close_btn)
+
+
+func _build_win_panel() -> void:
+	win_panel = Panel.new()
+	win_panel.set_anchors_preset(Control.PRESET_CENTER)
+	win_panel.size = Vector2(480, 240)
+	win_panel.position = Vector2(-240, -120)
+	win_panel.visible = false
+	ui_layer.add_child(win_panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.offset_left = 16
+	vbox.offset_top = 16
+	vbox.offset_right = -16
+	vbox.offset_bottom = -16
+	win_panel.add_child(vbox)
+
+	win_label = Label.new()
+	win_label.autowrap_mode = TextServer.AUTOWRAP_WORD
+	win_label.add_theme_font_size_override("font_size", 22)
+	vbox.add_child(win_label)
+
+	var restart_btn := Button.new()
+	restart_btn.text = "Play Again (new random murderer)"
+	restart_btn.pressed.connect(func(): get_tree().reload_current_scene())
+	vbox.add_child(restart_btn)
+
+
+# --------------------------------------------------------- name coloring --
+# Wherever conversation or notes text mentions a suspect by name, that name
+# gets colored to match their body color in the mansion (e.g. if Victoria
+# mentions Marcus, "Marcus" shows up in his red). The murder victim, Lord
+# Reginald Archibald, isn't a suspect (he has no body/color in the mansion),
+# so his name gets bold+underlined instead.
+
+# Common titles/honorifics the model might place directly in front of a
+# name ("Lady Victoria", "Mr. Sterling", "Dr. Blackwood", ...). Included as
+# an OPTIONAL prefix on every pattern so the whole phrase gets styled
+# together instead of just the bare name.
+const HONORIFIC_GROUP := "(?:Lord|Lady|Mr|Mrs|Ms|Miss|Dr|Sir)\\.?\\s+"
+
+var victim_regex: RegEx = null
+
+
+## All the distinct ways this suspect might reasonably be referred to:
+## surname, formal first name, nickname/short name, and "first + surname" /
+## "nickname + surname" combos. Using an explicit first_name field (rather
+## than trying to parse it out of the display name) is what makes sure a
+## formal first name like "Samuel" is caught even though his short name is
+## the nickname "Sam".
+func _name_variants(c: Dictionary) -> Array:
+	var full := String(c["name"]).replace('"', "")
+	while full.find("  ") != -1: # collapse double spaces left by removing a quoted nickname
+		full = full.replace("  ", " ")
+	var parts := full.split(" ")
+	var surname := String(parts[parts.size() - 1]) if parts.size() > 0 else ""
+	var first_name := String(c.get("first_name", c["short"]))
+	var short := String(c["short"])
+
+	var candidates := [full, first_name, short, surname]
+	if surname != "":
+		candidates.append("%s %s" % [first_name, surname])
+		candidates.append("%s %s" % [short, surname])
+
+	var seen := {}
+	var out := []
+	for cand in candidates:
+		var key := String(cand).strip_edges()
+		if key == "":
+			continue
+		var lk := key.to_lower()
+		if seen.has(lk):
+			continue
+		seen[lk] = true
+		out.append(key)
+	return out
+
+
+func _regex_escape(s: String) -> String:
+	var special := ["\\", ".", "^", "$", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|"]
+	var out := s
+	for ch in special:
+		out = out.replace(ch, "\\" + ch)
+	return out
+
+
+func _sorted_escaped(variants: Array) -> PackedStringArray:
+	var sorted_variants := variants.duplicate()
+	# Longest first, so e.g. "Marcus Sterling" is preferred over lone
+	# "Marcus" when both could match at the same position.
+	sorted_variants.sort_custom(func(a, b): return String(a).length() > String(b).length())
+	var escaped := PackedStringArray()
+	for v in sorted_variants:
+		escaped.append(_regex_escape(String(v)))
+	return escaped
+
+
+## Builds one compiled regex per suspect matching all of their unambiguous
+## name variants (full name, first name, nickname, surname, combos). A
+## variant shared by more than one suspect (e.g. "Cross" belongs to both
+## Natalie and Eugene) is dropped for everyone rather than guessing the
+## wrong color.
+func _build_name_regexes() -> void:
+	var variant_owner: Dictionary = {} # lowercase variant -> character_id, or "AMBIGUOUS"
+	var variants_by_char: Dictionary = {} # character_id -> Array[String]
+
+	for c in GameManager.active_characters():
+		var id: String = c["id"]
+		var variants: Array = _name_variants(c)
+		variants_by_char[id] = variants
+		for v in variants:
+			var key: String = v.to_lower()
+			if variant_owner.has(key) and variant_owner[key] != id:
+				variant_owner[key] = "AMBIGUOUS"
+			elif not variant_owner.has(key):
+				variant_owner[key] = id
+
+	name_regexes.clear()
+	for c in GameManager.active_characters():
+		var id: String = c["id"]
+		var valid_variants: Array = []
+		for v in variants_by_char[id]:
+			if variant_owner.get(String(v).to_lower(), "") == id:
+				valid_variants.append(v)
+		if valid_variants.is_empty():
+			continue
+
+		var escaped := _sorted_escaped(valid_variants)
+		var pattern := "(?i)\\b(?:" + HONORIFIC_GROUP + ")?(?:" + "|".join(escaped) + ")\\b"
+
+		var re := RegEx.new()
+		if re.compile(pattern) == OK:
+			name_regexes[id] = re
+
+	_build_victim_regex()
+
+
+## The victim isn't a suspect, but comes up constantly in questions/answers.
+## Matches "Lord Reginald Archibald" and shorter forms of it.
+func _build_victim_regex() -> void:
+	var raw := String(GameManager.VICTIM_NAME) # "Lord Reginald Archibald"
+	var parts := raw.split(" ")
+	var candidates := [raw]
+	if parts.size() >= 3:
+		candidates.append("%s %s" % [parts[1], parts[2]]) # "Reginald Archibald"
+		candidates.append("%s %s" % [parts[0], parts[2]]) # "Lord Archibald"
+		candidates.append(String(parts[1])) # "Reginald"
+		candidates.append(String(parts[2])) # "Archibald"
+	elif parts.size() > 0:
+		candidates.append(String(parts[parts.size() - 1]))
+
+	var seen := {}
+	var unique_candidates := []
+	for cand in candidates:
+		var lk := String(cand).to_lower()
+		if seen.has(lk):
+			continue
+		seen[lk] = true
+		unique_candidates.append(String(cand))
+
+	var escaped := _sorted_escaped(unique_candidates)
+	var pattern := "(?i)\\b(?:" + HONORIFIC_GROUP + ")?(?:" + "|".join(escaped) + ")\\b"
+
+	victim_regex = RegEx.new()
+	if victim_regex.compile(pattern) != OK:
+		victim_regex = null
+
+
+## Wraps every mention of the victim in bold+underline, and every mention of
+## a known suspect's name in `text` with a [color=#hex] tag matching that
+## suspect's body color.
+func _colorize_names(text: String) -> String:
+	var result := text
+	if victim_regex != null:
+		result = victim_regex.sub(result, "[b][u]$0[/u][/b]", true)
+	for id in name_regexes.keys():
+		var re: RegEx = name_regexes[id]
+		var color: Color = NPC_COLORS.get(id, Color.WHITE)
+		result = re.sub(result, "[color=#%s]$0[/color]" % color.to_html(false), true)
+	return result
+
+
+# ----------------------------------------------------------- UI behaviour --
+
+func show_prompt(text: String) -> void:
+	prompt_label.text = text
+	prompt_label.visible = true
+
+
+func hide_prompt() -> void:
+	prompt_label.visible = false
+
+
+func open_dialogue(character_id: String) -> void:
+	if win_panel.visible:
+		return
+	# Taking one suspect aside ends the confrontation - the others go back to
+	# wandering rather than standing frozen in the hall unattended.
+	if group_panel != null and group_panel.visible:
+		close_group_dialogue()
+	# If some other suspect was somehow still held, release them first.
+	_set_npc_talking(current_dialogue_character, false)
+	current_dialogue_character = character_id
+	# Freeze this NPC in place (facing the player) for the conversation.
+	_set_npc_talking(character_id, true)
+	var c := GameManager.get_character(character_id)
+	dialogue_name_label.text = String(c.get("name", ""))
+	dialogue_name_label.add_theme_color_override("font_color", NPC_COLORS.get(character_id, Color.WHITE))
+	dialogue_log.clear()
+	for entry in GameManager.transcript:
+		if entry["character_id"] == character_id:
+			_append_transcript_entry(entry)
+	dialogue_status_label.text = ""
+	dialogue_input.editable = true
+	# An unsent draft survives closing the panel, so re-measure rather than
+	# assuming the box is empty.
+	_fit_input_height(dialogue_input)
+	dialogue_ask_button.disabled = false
+	dialogue_panel.visible = true
+	player.set_mouse_captured(false)
+	dialogue_input.grab_focus()
+
+
+func close_dialogue() -> void:
+	dialogue_panel.visible = false
+	# Write their case notes up on the way out, so the summary is already
+	# running (and usually finished) by the time the notepad is opened, rather
+	# than starting only when their tab is clicked.
+	_request_summary_if_needed(current_dialogue_character)
+	# Let the suspect get back to wandering / finish any walk they were on.
+	_set_npc_talking(current_dialogue_character, false)
+	current_dialogue_character = ""
+	player.set_mouse_captured(true)
+
+
+## Holds an NPC still while the player is talking to them, or releases them.
+## Safe to call with an empty/unknown id.
+func _set_npc_talking(character_id: String, talking: bool) -> void:
+	if character_id == "" or not npc_nodes.has(character_id):
+		return
+	var npc = npc_nodes[character_id]
+	if not is_instance_valid(npc):
+		return
+	if talking and is_instance_valid(player):
+		npc.set_talking(true, player.global_position)
+	else:
+		npc.set_talking(talking)
+
+
+# ---------------------------------------------------------- hall meetup UI --
+
+## Opens a group confrontation with everyone standing in the Hall. Falls back
+## to a normal one-on-one if there's only one suspect in there.
+func open_group_dialogue() -> void:
+	if win_panel.visible:
+		return
+	var ids := hall_attendees()
+	if ids.size() < 2:
+		if ids.size() == 1:
+			open_dialogue(String(ids[0]))
+		return
+
+	close_dialogue()
+	_set_group_frozen(ids, true)
+
+	group_log.clear()
+	group_status_label.text = ""
+	group_input.editable = true
+	_fit_input_height(group_input)
+	group_say_button.disabled = false
+	group_panel.visible = true
+	player.set_mouse_captured(false)
+	group_input.grab_focus()
+
+	# Started before the roster is drawn so the guest list and mute state the
+	# buttons read from are the session's, not the previous scene's leftovers.
+	GameManager.group_chat.start(ids)
+	_rebuild_group_roster(ids)
+
+
+func close_group_dialogue() -> void:
+	GameManager.group_chat.stop()
+	group_panel.visible = false
+	# Everyone still in the room has new material in their file - their own
+	# lines, plus anything said about them in front of them - so refresh all of
+	# them. Anyone sent home earlier was already summarized on their way out.
+	for id in group_frozen_ids:
+		_request_summary_if_needed(String(id))
+	_set_group_frozen(group_frozen_ids, false)
+	if is_instance_valid(player):
+		player.set_mouse_captured(true)
+
+
+## Holds every attendee still (facing the detective) for the duration of the
+## scene, or releases them. Tracks who was frozen so the release can't miss
+## someone who has since left the Hall.
+func _set_group_frozen(ids: Array, frozen: bool) -> void:
+	if frozen:
+		group_frozen_ids = ids.duplicate()
+	for id in ids:
+		if not npc_nodes.has(id):
+			continue
+		var npc = npc_nodes[id]
+		if not is_instance_valid(npc):
+			continue
+		if frozen and is_instance_valid(player):
+			npc.set_group_scene(true, player.global_position)
+		else:
+			npc.set_group_scene(false)
+	if not frozen:
+		group_frozen_ids.clear()
+
+
+## One chip per attendee: their name in their own body color, plus a button
+## that silences or restores them. The button and the typed order ("Marcus, be
+## quiet") call exactly the same engine method, so the two can never disagree.
+func _rebuild_group_roster(ids: Array) -> void:
+	for child in group_roster.get_children():
+		group_roster.remove_child(child)
+		child.queue_free()
+
+	var gc = GameManager.group_chat
+	for id in ids:
+		var c := GameManager.get_character(id)
+		var silent: bool = gc.is_muted(id)
+
+		var col := VBoxContainer.new()
+		col.add_theme_constant_override("separation", 2)
+		group_roster.add_child(col)
+
+		var chip := Label.new()
+		chip.text = String(c.get("short", ""))
+		chip.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		chip.add_theme_font_size_override("font_size", 24)
+		var name_col: Color = NPC_COLORS.get(id, Color.WHITE)
+		if silent:
+			name_col = name_col.darkened(0.45)
+		chip.add_theme_color_override("font_color", name_col)
+		col.add_child(chip)
+
+		var btn := Button.new()
+		btn.text = "Let speak" if silent else "Silence"
+		btn.custom_minimum_size = Vector2(150, 0)
+		btn.add_theme_font_size_override("font_size", 18)
+		btn.pressed.connect(_toggle_attendee_muted.bind(id))
+		col.add_child(btn)
+
+		# Take one suspect aside. Without this the Hall is a trap: pressing E on
+		# anyone standing in it always opens the group panel, so once two
+		# suspects are gathered there's otherwise no route to a private
+		# conversation with either of them.
+		var alone_btn := Button.new()
+		alone_btn.text = "Speak alone"
+		alone_btn.custom_minimum_size = Vector2(150, 0)
+		alone_btn.add_theme_font_size_override("font_size", 18)
+		alone_btn.pressed.connect(open_dialogue.bind(id))
+		col.add_child(alone_btn)
+
+		var send_btn := Button.new()
+		send_btn.text = "Send home"
+		send_btn.custom_minimum_size = Vector2(150, 0)
+		send_btn.add_theme_font_size_override("font_size", 18)
+		send_btn.pressed.connect(_dismiss_attendee.bind(id))
+		col.add_child(send_btn)
+
+
+## Roster button handler. Un-silencing from the button only clears the mute -
+## it doesn't hand them the floor, because unlike typing "Marcus, go ahead"
+## there's no accompanying line from the detective for them to answer.
+func _toggle_attendee_muted(id: String) -> void:
+	var gc = GameManager.group_chat
+	gc.set_muted(id, not gc.is_muted(id))
+
+
+func _on_group_roster_changed() -> void:
+	if group_panel == null or not group_panel.visible:
+		return
+	_rebuild_group_roster(GameManager.group_chat.attendees)
+
+
+## Everyone left the hall, or all but one did. With nobody left there's nothing
+## to talk to, so the panel closes. With one left the panel keeps working -
+## it's just a private conversation held in a wider window now, and closing it
+## out from under a half-finished exchange would be more disruptive than
+## leaving it open.
+func _on_group_quorum_lost(remaining: int) -> void:
+	if group_panel == null or not group_panel.visible:
+		return
+	if remaining <= 0:
+		close_group_dialogue()
+
+
+## Releases a suspect from the confrontation's freeze and walks them to
+## `room_name` - or to their own starting room if none is given.
+func _walk_attendee_out(id: String, room_name: String = "") -> void:
+	# Sending someone home ends your conversation with them, so their notes get
+	# written up now rather than waiting for the rest of the scene to break up.
+	_request_summary_if_needed(id)
+	group_frozen_ids.erase(id)
+	if npc_nodes.has(id) and is_instance_valid(npc_nodes[id]):
+		npc_nodes[id].set_group_scene(false)
+	var dest := room_name
+	if dest == "":
+		dest = String(GameManager.get_character(id).get("room", ""))
+	if dest != "" and dest != MEETUP_ROOM:
+		command_npc_move(id, dest)
+
+
+## Sends one suspect back to their own room and drops them from the scene.
+func _dismiss_attendee(id: String) -> void:
+	if not GameManager.group_chat.dismiss(id):
+		return
+	_walk_attendee_out(id)
+
+
+## Drops one suspect from the scene and sends them to a room you named.
+func _move_attendee_out(id: String, room_name: String) -> void:
+	if not GameManager.group_chat.dismiss(id):
+		return
+	_walk_attendee_out(id, room_name)
+
+
+## Clears the whole Hall. Without this the only way out was dismissing each
+## suspect by name, and any you forgot stayed in the Hall occupying the
+## 4-person cap with no way to reach them one-on-one.
+func _dismiss_all_attendees() -> void:
+	for id in GameManager.group_chat.dismiss_all():
+		_walk_attendee_out(String(id))
+
+
+func _send_group_line() -> void:
+	if group_panel == null or not group_panel.visible:
+		return
+	var text := group_input.text.strip_edges()
+	if text == "":
+		return
+	var gc = GameManager.group_chat
+	# Orders and questions alike are refused mid-round; the input box is
+	# already disabled then, but Enter can still fire through it.
+	if gc.state != "awaiting_player":
+		return
+	group_input.text = ""
+	# See _send_question: a programmatic .text assignment does not fire
+	# text_changed, so the box has to be collapsed by hand.
+	_fit_input_height(group_input)
+
+	# Checked BEFORE command parsing, deliberately. "(Marcus, I hand you the
+	# letter)" contains a leading name and would otherwise be read as an order
+	# aimed at Marcus. A bracketed line is always a physical action, and always
+	# goes to the whole room - everyone present can see you do it.
+	if String(GameManager.parse_stage_action(text)["action"]) != "":
+		gc.submit_player_line(text)
+		return
+
+	var cmd := _parse_group_command(text)
+	var kind := String(cmd["kind"])
+	var id := String(cmd["id"])
+
+	match kind:
+		"silence_all":
+			gc.log_player_command(text)
+			gc.silence_all()
+		"silence_all_except":
+			gc.log_player_command(text)
+			gc.silence_all(id)
+		"unmute_all":
+			gc.log_player_command(text)
+			gc.allow_all()
+		"mute":
+			gc.log_player_command(text)
+			gc.set_muted(id, true)
+		"dismiss":
+			gc.log_player_command(text)
+			_dismiss_attendee(id)
+		"dismiss_all":
+			gc.log_player_command(text)
+			_dismiss_all_attendees()
+		"move":
+			gc.log_player_command(text)
+			_move_attendee_out(id, String(cmd.get("room", "")))
+		"unmute":
+			# Restoring someone by name also gives them the floor - "Marcus, go
+			# ahead" plainly expects Marcus to say something, not just to
+			# rejoin the rotation for next time. Announce is suppressed since
+			# his answer follows immediately.
+			gc.set_muted(id, false, false)
+			gc.submit_player_line(text, id)
+		"address":
+			gc.submit_player_line(text, id)
+		_:
+			gc.submit_player_line(text)
+
+
+## The four handlers below all null-check group_panel because GroupChat lives on
+## the GameManager autoload and outlives the scene: a "Play Again" reload
+## reconnects these signals in _ready(), well before _build_ui() has created the
+## panel, and start_new_game() can emit state_changed in that window.
+## Renders a suspect's bracketed gesture - "(nods) I was in the study" - as
+## italics, so an action reads differently from speech in the log. Applied
+## after _colorize_names() rather than before; BBCode uses square brackets, so
+## a colour tag can never be mistaken for an action here.
+func _italicize_actions(text: String) -> String:
+	var out := ""
+	var depth := 0
+	for i in range(text.length()):
+		var ch := text[i]
+		if ch == "(":
+			if depth == 0:
+				out += "[i]("
+			else:
+				out += ch
+			depth += 1
+		elif ch == ")" and depth > 0:
+			depth -= 1
+			out += ")[/i]" if depth == 0 else ch
+		else:
+			out += ch
+	if depth > 0: # unclosed bracket - close the tag so it can't bleed
+		out += "[/i]"
+	return out
+
+
+func _on_group_line_added(entry: Dictionary) -> void:
+	if group_panel == null or not group_panel.visible:
+		return
+	var speaker_id := String(entry["speaker_id"])
+	var text := _colorize_names(String(entry["text"]))
+	var kind := String(entry["kind"])
+	if kind == "stage":
+		group_log.append_text("[i]%s[/i]\n\n" % text)
+	elif kind == "command":
+		# An order to the room, not a line of dialogue - dimmed so it reads as
+		# something you did rather than something you said.
+		group_log.append_text("[b]You:[/b] [i][color=#9aa0a6]%s[/color][/i]\n" % text)
+	elif kind == "action":
+		# Something you physically did. Italic like a stage direction, but kept
+		# under your name so it's clear who did it - and undimmed, because
+		# unlike an order it's a real event the room reacts to.
+		group_log.append_text("[b]You:[/b] [i]%s[/i]\n\n" % text)
+	elif speaker_id == "":
+		group_log.append_text("[b]You:[/b] %s\n\n" % text)
+	else:
+		var c := GameManager.get_character(speaker_id)
+		var col: Color = NPC_COLORS.get(speaker_id, Color(1, 0.82, 0.5))
+		group_log.append_text("[b][color=#%s]%s:[/color][/b] %s\n\n" % [col.to_html(false), String(c.get("short", "")), _italicize_actions(text)])
+
+
+func _on_group_turn_started(character_id: String) -> void:
+	if group_panel == null or not group_panel.visible:
+		return
+	var c := GameManager.get_character(character_id)
+	group_status_label.text = "%s is thinking..." % String(c.get("short", ""))
+
+
+## The engine only accepts a new line while it's "awaiting_player", so the
+## input box mirrors that exactly - no way to queue a second question on top of
+## a round that's still resolving.
+func _on_group_state_changed(new_state: String) -> void:
+	if group_panel == null or not group_panel.visible:
+		return
+	var ready_for_input := new_state == "awaiting_player"
+	group_input.editable = ready_for_input
+	group_say_button.disabled = not ready_for_input
+	if ready_for_input:
+		group_status_label.text = ""
+		group_input.grab_focus()
+
+
+func _on_group_round_failed(message: String) -> void:
+	if group_panel == null or not group_panel.visible:
+		return
+	group_status_label.text = "Error: " + message
+
+
+## Writes one recorded exchange into the open one-on-one log. Lines this
+## suspect gave during a Hall meetup are replayed here too - it's one
+## continuous record for them - but marked, since the question above them was
+## put to the whole room rather than to them privately.
+func _append_transcript_entry(entry: Dictionary) -> void:
+	var c := GameManager.get_character(entry["character_id"])
+	var speaker_color: Color = NPC_COLORS.get(entry["character_id"], Color(1, 0.82, 0.5))
+	if String(entry.get("scene", "")) == "group":
+		dialogue_log.append_text("[i][color=#9aa0a6]in the hall[/color][/i]\n")
+	var question := String(entry["question"])
+	if question != "":
+		dialogue_log.append_text("[b]You:[/b] %s\n" % _italicize_actions(_colorize_names(question)))
+	dialogue_log.append_text("[b][color=#%s]%s:[/color][/b] %s\n\n" % [speaker_color.to_html(false), String(c.get("short", "")), _italicize_actions(_colorize_names(String(entry["answer"])))])
+
+
+func _send_question() -> void:
+	var q := dialogue_input.text.strip_edges()
+	if q == "" or current_dialogue_character == "":
+		return
+	dialogue_input.text = ""
+	# Assigning .text in code does not emit text_changed, so without this the box
+	# would stay three rows tall while showing nothing.
+	_fit_input_height(dialogue_input)
+
+	# "Go to the library" / "wait in the study" etc. are handled locally as
+	# stage directions rather than sent to Ollama as an in-character question.
+	#
+	# Skipped entirely for a bracketed action: "(I walk Tom to the library)"
+	# contains "walk ... to ... library" and would otherwise be swallowed as a
+	# movement order instead of being roleplayed.
+	if String(GameManager.parse_stage_action(q)["action"]) == "":
+		var move_room := _parse_move_command(q)
+		if move_room != "":
+			_handle_move_command(current_dialogue_character, move_room, q)
+			return
+
+	dialogue_input.editable = false
+	dialogue_ask_button.disabled = true
+	var c := GameManager.get_character(current_dialogue_character)
+	dialogue_status_label.text = "%s is thinking..." % String(c.get("short", ""))
+	GameManager.ask_character(current_dialogue_character, q)
+
+
+func _on_ollama_response(character_id: String, _text: String) -> void:
+	if character_id == current_dialogue_character:
+		dialogue_status_label.text = ""
+		var last: Dictionary = GameManager.transcript[GameManager.transcript.size() - 1]
+		_append_transcript_entry(last)
+		dialogue_input.editable = true
+		dialogue_ask_button.disabled = false
+		dialogue_input.grab_focus()
+	# Dialogue can't actually be open at the same time as the Notes panel
+	# (opening Notes releases the mouse, which disables interaction), but
+	# keep this in sync just in case that ever changes.
+	# Null as well as hidden: see the note on _on_summary_ready. The branch above
+	# needs no such check - current_dialogue_character can only be non-empty once
+	# open_dialogue() has run, which cannot happen before _build_ui().
+	if notes_panel != null and notes_panel.visible and notes_selected_char == character_id:
+		_render_notes_content(character_id)
+
+
+func _on_ollama_error(character_id: String, message: String) -> void:
+	if character_id == current_dialogue_character:
+		dialogue_status_label.text = "Error: " + message
+		dialogue_input.editable = true
+		dialogue_ask_button.disabled = false
+
+
+## Called by Evidence.interact(). Shows the description and files it in the
+## case notes the first time it's seen.
+func open_examine(node) -> void:
+	if examine_panel == null:
+		return
+	GameManager.note_evidence(String(node.evidence_id), String(node.title), String(node.examine_text))
+	examine_title_label.text = String(node.title).capitalize()
+	examine_body.clear()
+	examine_body.append_text(_colorize_names(String(node.examine_text)))
+	examine_panel.visible = true
+	hide_prompt()
+	if player:
+		player.set_mouse_captured(false)
+
+
+func close_examine() -> void:
+	if examine_panel == null:
+		return
+	examine_panel.visible = false
+	if player:
+		player.set_mouse_captured(true)
+
+
+func open_accusation() -> void:
+	close_dialogue()
+	# The front door can't be reached with the meetup panel open (the mouse is
+	# released, which disables interaction), but leaving a live confrontation
+	# running behind the accusation screen would strand frozen suspects if that
+	# ever changes.
+	if group_panel != null and group_panel.visible:
+		close_group_dialogue()
+	accusation_result_label.text = ""
+	accusation_selected_id = ""
+	accusation_accuse_button.disabled = true
+	for bid in accusation_suspect_buttons.keys():
+		var btn: Button = accusation_suspect_buttons[bid]
+		btn.remove_theme_stylebox_override("normal")
+		btn.remove_theme_stylebox_override("hover")
+	accusation_panel.visible = true
+	player.set_mouse_captured(false)
+
+
+func close_accusation() -> void:
+	accusation_panel.visible = false
+	player.set_mouse_captured(true)
+
+
+func _submit_accusation() -> void:
+	if accusation_selected_id == "":
+		return
+	if GameManager.check_accusation(accusation_selected_id):
+		accusation_panel.visible = false
+		var c := GameManager.get_character(GameManager.murderer_id)
+		win_label.text = "Case closed! %s was the murderer.\n\nMotive: %s" % [String(c.get("name", "")), String(c.get("flavor", ""))]
+		win_panel.visible = true
+		player.set_mouse_captured(false)
+	else:
+		var c := GameManager.get_character(accusation_selected_id)
+		accusation_result_label.text = "%s isn't who the evidence points to. Keep investigating..." % String(c.get("short", "That suspect"))
+
+
+func toggle_notes() -> void:
+	if win_panel.visible:
+		return
+	notes_panel.visible = not notes_panel.visible
+	if notes_panel.visible:
+		# Default to whichever suspect was showing last time, unless you
+		# haven't talked to them (or anyone) - then pick the first suspect
+		# with any conversation.
+		# has_notes() only means anything for a suspect - don't let it bounce
+		# you off the evidence tab, which has its own contents.
+		if notes_selected_char != EVIDENCE_TAB and (notes_selected_char == "" or not GameManager.has_notes(notes_selected_char)):
+			notes_selected_char = _first_interviewed_character()
+			# Nothing said to anyone yet, but you've been looking around.
+			if notes_selected_char == "" and not GameManager.evidence_found.is_empty():
+				notes_selected_char = EVIDENCE_TAB
+		_select_notes_character(notes_selected_char)
+		player.set_mouse_captured(false)
+	elif not dialogue_panel.visible and not accusation_panel.visible and not map_panel.visible:
+		player.set_mouse_captured(true)
+
+
+func _first_interviewed_character() -> String:
+	for c in GameManager.active_characters():
+		if GameManager.has_notes(c["id"]):
+			return c["id"]
+	return ""
+
+
+## Switches the right-hand pane to a suspect, kicking off a summary request
+## for them (lazily, per-tab, rather than for everyone at once) if their
+## conversation has grown since their last summary and one isn't already in
+## flight.
+func _select_notes_character(id: String) -> void:
+	notes_selected_char = id
+	_update_notes_tab_styles()
+	# Conversations now summarize themselves as they end, so by this point the
+	# notes are usually already written. This stays as the backstop for the
+	# cases that skip that path - a summary that failed and is being retried, or
+	# a suspect whose file grew while you were talking to somebody else.
+	_request_summary_if_needed(id)
+	_render_notes_content(id)
+
+
+## Starts a case-notes summary for one suspect, unless there's nothing new to
+## say about them or a request for them is already in flight. Every caller goes
+## through here, so the guards can't drift apart between the "conversation
+## ended" path and the notepad-tab path.
+##
+## The evidence pane is read straight out of what you've examined, so it has
+## nothing to summarize and never reaches the model.
+func _request_summary_if_needed(id: String) -> void:
+	if id == "" or id == EVIDENCE_TAB:
+		return
+	if _pending_summaries.has(id):
+		return
+	if not GameManager.needs_summary_refresh(id):
+		return
+	_pending_summaries[id] = true
+	GameManager.request_summary(id)
+
+
+## Refreshes every tab's three indicators: a highlighted background if it's
+## the currently selected suspect, dimming if you haven't talked to them
+## yet, and a red dot if their Slipups section has real content. Tab text
+## color itself always stays that suspect's body color and is never
+## overridden, so it stays consistent whether selected or not.
+func _update_notes_tab_styles() -> void:
+	for id in notes_tab_buttons.keys():
+		var btn: Button = notes_tab_buttons[id]
+		# The evidence tab dims until you've actually examined something.
+		var talked: bool = (not GameManager.evidence_found.is_empty()) if id == EVIDENCE_TAB else GameManager.has_notes(id)
+		btn.modulate = Color(1, 1, 1, 1.0) if talked else Color(1, 1, 1, 0.4)
+
+		if id == notes_selected_char:
+			btn.add_theme_stylebox_override("normal", _selected_tab_stylebox())
+			btn.add_theme_stylebox_override("hover", _selected_tab_stylebox())
+		else:
+			btn.remove_theme_stylebox_override("normal")
+			btn.remove_theme_stylebox_override("hover")
+
+		var dot: ColorRect = notes_flag_dots.get(id)
+		if dot:
+			dot.visible = id != EVIDENCE_TAB and _has_slipup_flag(id)
+
+
+func _selected_tab_stylebox() -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(1, 1, 1, 0.16)
+	sb.corner_radius_top_left = 4
+	sb.corner_radius_top_right = 4
+	sb.corner_radius_bottom_left = 4
+	sb.corner_radius_bottom_right = 4
+	sb.content_margin_left = 6
+	return sb
+
+
+## True if a suspect's Slipups section has real, non-empty content - as
+## opposed to being blank or the model's "nothing notable" placeholder.
+func _has_slipup_flag(id: String) -> bool:
+	var summary: Dictionary = GameManager.get_summary(id)
+	if summary.is_empty():
+		return false
+	var s: String = String(summary.get("slipups", "")).strip_edges().to_lower()
+	if s == "":
+		return false
+	var negative_markers := ["nothing notable", "nothing relevant", "nothing suspicious", "no slip", "n/a", "none yet", "none noted"]
+	for m in negative_markers:
+		if s.find(m) != -1:
+			return false
+	return true
+
+
+## GameManager is an autoload, so it outlives the scene. On a "Play Again"
+## reload _ready() reconnects these signals immediately, but _build_ui() does
+## not run until the player has finished with the suspect-selection screen - so
+## a summary or a reply still in flight from the PREVIOUS case can land in that
+## window, with every panel still null. Same reasoning as the group handlers
+## further up, which null-check group_panel for exactly this.
+func _on_summary_ready(character_id: String, _text: String) -> void:
+	_pending_summaries.erase(character_id)
+	if notes_panel == null or not notes_panel.visible:
+		return
+	_update_notes_tab_styles() # refreshes that suspect's slipup flag dot
+	if notes_selected_char == character_id:
+		_render_notes_content(character_id)
+
+
+func _on_summary_error(character_id: String, _message: String) -> void:
+	_pending_summaries.erase(character_id)
+	if notes_panel == null or not notes_panel.visible:
+		return
+	_update_notes_tab_styles()
+	if notes_selected_char == character_id:
+		_render_notes_content(character_id)
+
+
+## Renders the right-hand pane for one suspect: their Timeline / Motive /
+## Slipups / Contradictions sections, a "Summarizing..." placeholder while one's
+## in flight, or a raw transcript fallback if no summary is available (nothing
+## asked yet, or the last summarization attempt failed).
+## The physical case file: everything you've examined, in the order you found
+## it. Unlike the suspect tabs this is never AI-summarized - it's what you saw
+## with your own eyes, so it's reproduced verbatim and can be trusted against
+## anything a suspect tells you.
+func _render_evidence_notes() -> void:
+	notes_log.append_text("[b][color=#ffd9a0]The Crime Scene[/color][/b]\n\n")
+	if GameManager.evidence_found.is_empty():
+		notes_log.append_text("[i]You haven't examined anything yet.[/i]\n\n")
+		notes_log.append_text("The body is somewhere in the manor. Find it, and look at what's around it - ")
+		notes_log.append_text("the weapon will tell you which room it was taken from, and that narrows down ")
+		notes_log.append_text("who could have taken it.")
+		return
+
+	notes_log.append_text("[color=#999999]%d thing%s examined. This is what you saw yourself - unlike an interview, none of it is anyone's word against anyone else's.[/color]\n\n" % [
+		GameManager.evidence_found.size(), "" if GameManager.evidence_found.size() == 1 else "s"])
+
+	for e in GameManager.evidence_found:
+		notes_log.append_text("[b][color=#ffd9a0]%s[/color][/b]\n" % String(e["title"]).capitalize())
+		notes_log.append_text("%s\n\n" % _colorize_names(String(e["text"])))
+
+
+func _render_notes_content(id: String) -> void:
+	notes_log.clear()
+	if id == EVIDENCE_TAB:
+		_render_evidence_notes()
+		return
+	if id == "":
+		notes_log.append_text("Talk to a suspect, then check back here.")
+		return
+
+	var c := GameManager.get_character(id)
+	var name_color: Color = NPC_COLORS.get(id, Color.WHITE)
+	notes_log.append_text("[b][color=#%s]%s[/color][/b] [color=#999999](%s)[/color]\n\n" % [name_color.to_html(false), String(c.get("name", "")), String(c.get("job", ""))])
+
+	# Sources, not just their own answers: a suspect who stood silently through
+	# a Hall confrontation still has notes worth reading.
+	var entries: Array = GameManager.summary_sources(id)
+	if entries.is_empty():
+		notes_log.append_text("You haven't asked %s anything yet." % String(c.get("short", "them")))
+		return
+
+	if _pending_summaries.has(id):
+		notes_log.append_text("[i]Summarizing...[/i]")
+		return
+
+	var summary: Dictionary = GameManager.get_summary(id)
+	if summary.is_empty():
+		# No structured summary available - fall back to the raw record.
+		for e in entries:
+			var answer := _colorize_names(String(e["answer"]))
+			if String(e["character_id"]) != id:
+				var other := GameManager.get_character(String(e["character_id"]))
+				notes_log.append_text("[i]In the hall, %s said:[/i] %s\n\n" % [String(other.get("short", "someone")), answer])
+			elif String(e.get("scene", "")) == "group":
+				notes_log.append_text("[i]In the hall[/i]\nQ: %s\nA: %s\n\n" % [_colorize_names(String(e["question"])), answer])
+			else:
+				notes_log.append_text("Q: %s\nA: %s\n\n" % [_colorize_names(String(e["question"])), answer])
+		return
+
+	notes_log.append_text("[b][color=#8fd3ff]TIMELINE[/color][/b]\n")
+	_append_timeline_table(String(summary.get("timeline", "")))
+	notes_log.append_text("\n")
+	notes_log.append_text("[b][color=#ffb37a]POTENTIAL REASON TO KILL[/color][/b]\n%s\n\n" % _colorize_names(_section_or_placeholder(summary.get("motive", ""))))
+	notes_log.append_text("[b][color=#ff8f8f]SLIPUPS[/color][/b]\n%s\n\n" % _colorize_names(_section_or_placeholder(summary.get("slipups", ""))))
+	notes_log.append_text("[b][color=#ffd166]CONTRADICTIONS[/color][/b]\n%s\n\n" % _colorize_names(_section_or_placeholder(summary.get("contradictions", ""))))
+
+
+func _section_or_placeholder(text: String) -> String:
+	var t := String(text).strip_edges()
+	if t == "":
+		return "Nothing notable yet."
+	return t
+
+
+## Label used in the time column when a suspect gave no clock time at all.
+## Worth showing rather than hiding - a vague "sometime later" is itself a
+## thing the detective should notice.
+const TIMELINE_UNKNOWN := "Unclear"
+
+
+## Fragments that mean the model has narrated the interrogation instead of last
+## night, or promoted another guest's overheard line into this suspect's alibi.
+## The summary prompt forbids both, but it is a small local model and it still
+## slips, and when it slips the player opens the notepad to a timeline of their
+## own conversation. Dropping the row costs a short timeline instead of a
+## nonsense one.
+const TIMELINE_REJECT := ["detective", "overheard", "the player"]
+
+## Shown when the model left the claim side of a bullet empty, or filled it with
+## the "Unclear" placeholder that belongs in the time column. A gap in the
+## account is worth keeping: it is exactly the half hour worth asking about.
+const TIMELINE_NO_CLAIM := "Whereabouts not stated."
+
+## The murder night runs from dinner at eight until midnight, with a little
+## slack at either end. A clock time outside this window is one the model made
+## up, nearly always by dating the morning's questioning, so the claim survives
+## and the invented time does not.
+const TIMELINE_EARLIEST_MIN := 18 * 60
+const TIMELINE_LATEST_MIN := 25 * 60
+
+## Compiled on first use and reused: the notepad re-parses a timeline every time
+## a suspect's tab is drawn.
+var _timeline_time_re: RegEx = null
+
+
+## Reads the first clock time out of a time cell ("9:20pm", "9:00pm-9:20pm",
+## "around 10pm") as minutes past midnight, with small-hours times pushed past
+## the 24h mark so they sort as the same night: 8:00pm is 1200, 12:30am is 1470.
+## Returns -1 when the cell holds no clock time at all, which is not a problem,
+## since "After dinner" is a perfectly good thing to leave in the time column.
+func _timeline_minutes(raw: String) -> int:
+	if _timeline_time_re == null:
+		_timeline_time_re = RegEx.new()
+		_timeline_time_re.compile("(\\d{1,2})(?::(\\d{2}))?\\s*([ap])\\.?m")
+	var m := _timeline_time_re.search(raw.to_lower())
+	if m == null:
+		return -1
+	var hour := int(m.get_string(1))
+	var minute := 0
+	if m.get_string(2) != "":
+		minute = int(m.get_string(2))
+	if m.get_string(3) == "p" and hour != 12:
+		hour += 12
+	elif m.get_string(3) == "a" and hour == 12:
+		hour = 0
+	var total := hour * 60 + minute
+	if total < 6 * 60:
+		total += 24 * 60  # 12:30am is the end of last night, not the start of it.
+	return total
+
+
+## True for a row that is about the questioning rather than about last night.
+func _timeline_row_rejected(event: String) -> bool:
+	var lowered := event.to_lower()
+	for frag in TIMELINE_REJECT:
+		if lowered.find(String(frag)) != -1:
+			return true
+	return false
+
+
+## Strips a bullet's claim down to letters and digits, so "Unclear | ...", "..."
+## and "" all collapse to something testable.
+func _timeline_claim_is_blank(event: String) -> bool:
+	var squashed := ""
+	var lowered := event.to_lower()
+	for i in range(lowered.length()):
+		var code := lowered.unicode_at(i)
+		if (code >= 97 and code <= 122) or (code >= 48 and code <= 57):
+			squashed += String.chr(code)
+	return squashed == "" or squashed == "unclear" or squashed == "unknown" or squashed == "na"
+
+
+## The model returns TIMELINE bullets as "- TIME | what they claim". Laying
+## them out as a two-column table puts every time in its own aligned column,
+## so an evening can be scanned at a glance instead of read as four sentences.
+## If the model ignored the format (or the section is the placeholder), this
+## falls back to the old plain-text rendering rather than showing a broken table.
+func _append_timeline_table(raw: String) -> void:
+	var rows := _parse_timeline_rows(raw)
+	if rows.is_empty():
+		notes_log.append_text("%s\n" % _colorize_names(_section_or_placeholder(raw)))
+		return
+
+	notes_log.append_text("[table=2]")
+	for r in rows:
+		var t := String(r["time"])
+		var time_cell := ""
+		if t == TIMELINE_UNKNOWN:
+			time_cell = "[color=#777777][i]%s[/i][/color]" % t
+		else:
+			time_cell = "[color=#8fd3ff]%s[/color]" % t
+		notes_log.append_text("[cell ratio=1]%s[/cell]" % time_cell)
+		notes_log.append_text("[cell ratio=3]%s[/cell]" % _colorize_names(String(r["event"])))
+	notes_log.append_text("[/table]\n")
+
+
+## Turns the raw TIMELINE block into [{time, event}, ...]. Returns an empty
+## Array if not a single line used the pipe format, which is the caller's
+## signal to fall back to plain text.
+func _parse_timeline_rows(raw: String) -> Array:
+	var timed: Array = []
+	var untimed: Array = []
+	var saw_pipe := false
+
+	for line in String(raw).split("\n"):
+		var t := String(line).strip_edges()
+		# Strip whatever bullet marker the model decided to use this time.
+		while t.begins_with("-") or t.begins_with("*") or t.begins_with("•"):
+			t = t.substr(1).strip_edges()
+		if t == "":
+			continue
+
+		var time_part := TIMELINE_UNKNOWN
+		var event_part := t
+		if t.find("|") != -1:
+			# Split on every pipe, not just the first. The model sometimes adds a
+			# third field ("9:30pm | In the Hall, overheard | ..."), and reading
+			# only as far as the first pipe leaves that marker in the event column.
+			var parts := t.split("|", false)
+			var head := String(parts[0]).strip_edges()
+			var tail := []
+			for i in range(1, parts.size()):
+				var seg := String(parts[i]).strip_edges()
+				if seg != "":
+					tail.append(seg)
+			if not tail.is_empty():
+				saw_pipe = true
+				event_part = ", ".join(PackedStringArray(tail))
+				if head != "":
+					time_part = head
+
+		# Last night only. A bullet narrating the questioning itself gets dropped
+		# rather than shown with a made-up clock time beside it.
+		if _timeline_row_rejected(event_part):
+			continue
+		if _timeline_claim_is_blank(event_part):
+			event_part = TIMELINE_NO_CLAIM
+
+		var lowered := time_part.to_lower()
+		if lowered.begins_with("unclear") or lowered.begins_with("unknown") or lowered.begins_with("unspecified"):
+			time_part = TIMELINE_UNKNOWN
+		else:
+			var mins := _timeline_minutes(time_part)
+			if mins != -1 and (mins < TIMELINE_EARLIEST_MIN or mins > TIMELINE_LATEST_MIN):
+				time_part = TIMELINE_UNKNOWN
+
+		if time_part == TIMELINE_UNKNOWN:
+			untimed.append({"time": TIMELINE_UNKNOWN, "event": event_part})
+		else:
+			timed.append({"time": time_part, "event": event_part})
+
+	if not saw_pipe:
+		return []
+	if timed.is_empty() and untimed.is_empty():
+		# Every bullet was about the questioning. Say so, rather than returning
+		# empty and letting the caller print the raw block we just rejected.
+		return [{"time": TIMELINE_UNKNOWN, "event": "No account of last night yet."}]
+	# Timed rows keep the model's chronological order; vague ones sink to the bottom.
+	return timed + untimed
+
+
+# --------------------------------------------------------------- debug UI --
+# A dev/testing aid so you don't have to interrogate the whole cast just to
+# confirm the murderer logic is working. This is meant for testing only -
+# remove the Ctrl+1 binding (in GameManager._setup_input_map) before sharing
+# builds with anyone you actually want to keep guessing.
+
+func toggle_debug() -> void:
+	debug_label.visible = not debug_label.visible
+	if debug_label.visible:
+		_refresh_debug_label()
+
+
+func _refresh_debug_label() -> void:
+	var c := GameManager.get_character(GameManager.murderer_id)
+	var t := "[DEBUG] Case %s\nMurderer: %s\nWeapon: %s\nWhere: %s\nWhen: %s" % [
+		GameManager.case_code(), String(c.get("name", "?")), GameManager.murder_weapon,
+		GameManager.murder_room, GameManager.murder_time]
+
+	# The whole truth table, so a suspect's answer can be checked against what
+	# actually happened without digging through the console.
+	var case: Dictionary = GameManager.case_data
+	if case.is_empty():
+		debug_label.text = t + "\n(fallback scenario - no generated case)"
+		return
+
+	var w: Dictionary = case["weapon"]
+	var ms := int(case["murder_slot"])
+	t += "\nWeapon kept in: %s" % String(w["home_room"])
+	t += "\nMethod: %s" % String(case["method"])
+	t += "\nLie: claims %s for %s" % [
+		String(case["claimed_room"]),
+		CaseGenerator.block_time({"from_slot": int(case["diverge_from"]), "to_slot": int(case["diverge_to"])})]
+	var wits := []
+	for wid in case["witness_ids"]:
+		wits.append(String(GameManager.get_character(String(wid)).get("short", wid)))
+	t += "\nDisproved by: %s" % ", ".join(PackedStringArray(wits))
+
+	t += "\n\n%s" % "  ".join(PackedStringArray(CaseGenerator.SLOT_TIMES))
+	t += "\nVICTIM: %s" % _debug_path(Array(case["victim_path"]), ms)
+	for id in GameManager.active_character_ids:
+		var sid := String(id)
+		var sc := GameManager.get_character(sid)
+		var mark := " *" if sid == GameManager.murderer_id else ""
+		t += "\n%s%s: %s" % [String(sc.get("short", sid)), mark, _debug_path(Array(case["true_paths"][sid]), -1)]
+		if sid == GameManager.murderer_id:
+			t += "\n  claims: %s" % _debug_path(Array(case["claimed_paths"][sid]), -1)
+	debug_label.text = t
+
+
+## Compresses a schedule to initials so the whole cast fits in the overlay -
+## "DR Li Li Ha St St St St", with [] marking the murder slot.
+func _debug_path(path: Array, mark_slot: int) -> String:
+	var out := []
+	for i in range(path.size()):
+		var room := String(path[i])
+		var short_name := room.substr(0, 2)
+		var parts := room.split(" ")
+		if parts.size() > 1:
+			short_name = String(parts[0]).substr(0, 1) + String(parts[1]).substr(0, 1)
+		if i == mark_slot:
+			short_name = "[" + short_name + "]"
+		out.append(short_name)
+	return " ".join(PackedStringArray(out))
